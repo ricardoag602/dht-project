@@ -45,7 +45,29 @@ int main(int argCount, char *argValue[]) {
 
     // manager runs an infinite loop listening for messages
     while (true) {
-      // Future step: recvfrom() logic goes here
+
+      char buffer[1024];
+      struct sockaddr_in peer_addr;
+      socklen_t peer_len = sizeof(peer_addr);
+
+      // 2. Block and wait for an incoming UDP datagram
+      ssize_t bytes_received =
+          recvfrom(manager_socket, (char *)buffer, sizeof(buffer) - 1,
+                   MSG_WAITALL, (struct sockaddr *)&peer_addr, &peer_len);
+
+      if (bytes_received < 0) {
+        std::cerr << "Error: Failed to receive message.\n";
+        continue;
+      }
+
+      buffer[bytes_received] = '\0';
+      std::string incoming_msg(buffer);
+
+      std::cout << "Received raw message: " << incoming_msg << "\n";
+
+      // TODO: Parse the incoming_msg based on your delimiter
+      // TODO: Execute the requested comman (register, setup-dht, etc.)
+      // TODO: Send SUCCESS or FAILURE back to the peer using sendto()
     }
 
   } catch (const std::exception &e) {
