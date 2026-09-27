@@ -1,66 +1,164 @@
 #include <arpa/inet.h>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <iostream>
 #include <netinet/in.h>
 #include <sstream>
 #include <string>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
-int main(int argCount, char *argValue[]) {
+// Helper: Split incoming delimited strings
+std::vector<std::string> splitMessage(const std::string &msg, char delimiter) {
+  std::vector<std::string> tokens;
+  std::string token;
+  std::istringstream tokenStream(msg);
+  while (std::getline(tokenStream, token, delimiter)) {
+    tokens.push_back(token);
+  }
+  return tokens;
+}
 
-  // 1. Validate command-line arguments
-  if (argCount != 3) {
-    std::cerr << "Usage: " << argValue[0] << " <manager_ipv4> <manager_port>\n";
+// Helper: Safely bind the P2P socket with error handling
+int setup_p2p_socket(int port) {
+  int sock = socket(AF_INET, SOCK_DGRAM, 0);
+  if (sock < 0)
+    return -1;
+
+  struct sockaddr_in p_addr;
+  std::memset(&p_addr, 0, sizeof(p_addr));
+  p_addr.sin_family = AF_INET;
+  p_addr.sin_addr.s_addr = INADDR_ANY;
+  p_addr.sin_port = htons(port);
+
+  if (bind(sock, (const struct sockaddr *)&p_addr, sizeof(p_addr)) < 0) {
+    std::cerr << "Error: Bind failed on P2P port " << port
+              << ". Port may be in use.\n";
+    close(sock);
+    return -1;
+  }
+  return sock;
+}
+
+// Helper: Process the manager's response and execute subsequent P2P actions
+void handle_manager_response(const std::string &req_msg,
+                             const std::string &resp_msg, int &p_port_socket) {
+  std::vector<std::string> req_tokens = splitMessage(req_msg, '|');
+  std::vector<std::string> resp_tokens = splitMessage(resp_msg, '|');
+
+  if (req_tokens.empty() || resp_tokens.empty())
+    return;
+
+  // Handle successful registration: Bind the local P2P socket
+  if (req_tokens[0] == "register" && resp_tokens[0] == "SUCCESS") {
+    int p_port = std::stoi(req_tokens[4]);
+    p_port_socket = setup_p2p_socket(p_port);
+
+    if (p_port_socket != -1) {
+      std::cout << "Local P2P socket successfully bound to port " << p_port
+                << ".\n";
+    }
+  }
+
+  // Handle successful DHT setup: Act as Leader and route set-id messages[cite:
+  // 1]
+  if (req_tokens[0] == "setup-dht" && resp_tokens[0] == "SUCCESS") {
+    int n = std::stoi(req_tokens[2]);
+    std::cout << "Assigned Leader status. Building logical ring of size " << n
+              << "...\n";
+
+    std::string all_tuples = "";
+    for (size_t i = 1; i < resp_tokens.size(); ++i) {
+      all_tuples += "|" + resp_tokens[i];
+    }
+
+    for (int i = 1; i < n; ++i) {
+      int base_idx = 1 + (i * 3);
+      std::string target_name = resp_tokens[base_idx];
+      std::string target_ip = resp_tokens[base_idx + 1];
+      int target_port = std::stoi(resp_tokens[base_idx + 2]);
+
+      std::string set_id_msg =
+          "set-id|" + std::to_string(i) + "|" + std::to_string(n) + all_tuples;
+
+      struct sockaddr_in peer_dest;
+      std::memset(&peer_dest, 0, sizeof(peer_dest));
+      peer_dest.sin_family = AF_INET;
+      peer_dest.sin_port = htons(target_port);
+      inet_pton(AF_INET, target_ip.c_str(), &peer_dest.sin_addr);
+
+      sendto(p_port_socket, set_id_msg.c_str(), set_id_msg.length(), 0,
+             (const struct sockaddr *)&peer_dest, sizeof(peer_dest));
+
+      std::cout << "Sent set-id data to " << target_name << " at " << target_ip
+                << ":" << target_port << "\n";
+    }
+  }
+}
+
+int main(int argc, char *argv[]) {
+  if (argc != 3) {
+    std::cerr << "Usage: " << argv[0] << " <manager_ipv4> <manager_port>\n";
     return EXIT_FAILURE;
   }
 
+  std::string manager_ip = argv[1];
+  int manager_port;
   try {
-    std::string manager_ip = argValue[1];
-    int manager_port = std::stoi(argValue[2]);
+    manager_port = std::stoi(argv[2]);
+  } catch (...) {
+    std::cerr << "Error: Invalid port.\n";
+    return EXIT_FAILURE;
+  }
 
-    // 2. Create the UDP socket (same as the manager)
-    int peer_socket = socket(AF_INET, SOCK_DGRAM, 0);
-    if (peer_socket < 0) {
-      std::cerr << "Error: Socket creation failed.\n";
-      return EXIT_FAILURE;
+  int manager_socket = socket(AF_INET, SOCK_DGRAM, 0);
+  struct sockaddr_in dest_addr;
+  std::memset(&dest_addr, 0, sizeof(dest_addr));
+  dest_addr.sin_family = AF_INET;
+  dest_addr.sin_port = htons(manager_port);
+  inet_pton(AF_INET, manager_ip.c_str(), &dest_addr.sin_addr);
+
+  int p_port_socket = -1;
+  std::string wire_msg = "";
+
+  std::cout << "Peer started. Manager at " << manager_ip << ":" << manager_port
+            << "\n";
+  std::cout
+      << "Enter commands (e.g., register <name> <ip> <m-port> <p-port>)\n> ";
+
+  while (true) {
+    fd_set read_fds;
+    FD_ZERO(&read_fds);
+    FD_SET(STDIN_FILENO, &read_fds);
+    int max_fd = STDIN_FILENO;
+
+    if (p_port_socket != -1) {
+      FD_SET(p_port_socket, &read_fds);
+      if (p_port_socket > max_fd)
+        max_fd = p_port_socket;
     }
 
-    // 3. Configure the manager's destination address structure
-    struct sockaddr_in dest_addr;
-    std::memset(&dest_addr, 0, sizeof(dest_addr));
-    dest_addr.sin_family = AF_INET;
-    dest_addr.sin_port = htons(manager_port);
-
-    // Convert the IPv4 string into a binary network address
-    if (inet_pton(AF_INET, manager_ip.c_str(), &dest_addr.sin_addr) <= 0) {
-      std::cerr << "Error: Invalid manager IP address.\n";
-      close(peer_socket);
-      return EXIT_FAILURE;
+    if (select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr) < 0) {
+      std::cerr << "Error in select multiplexing.\n";
+      break;
     }
 
-    std::cout << "Peer started. Manager at " << manager_ip << ":"
-              << manager_port << "\n";
-    std::cout << "Enter commands (e.g., <name> <ip> <m-port> <p-port>\n> ";
+    // --- Handle Terminal Input ---
+    if (FD_ISSET(STDIN_FILENO, &read_fds)) {
+      std::string input_line;
+      std::getline(std::cin, input_line);
 
-    std::string input_line;
-
-    // 4. Interactive loop reading from stdin
-    while (std::getline(std::cin, input_line)) {
       if (input_line.empty()) {
         std::cout << "> ";
         continue;
       }
 
-      // Convert space-separated user input into the pipe-delimited wire
-      // protocol
       std::istringstream iss(input_line);
       std::string token;
-      std::string wire_msg = "";
+      wire_msg = "";
       bool first = true;
-
       while (iss >> token) {
         if (!first)
           wire_msg += "|";
@@ -68,38 +166,46 @@ int main(int argCount, char *argValue[]) {
         first = false;
       }
 
-      // 5. Send the formatted message to the manager
-      ssize_t bytes_sent =
-          sendto(peer_socket, wire_msg.c_str(), wire_msg.length(), 0,
-                 (const struct sockaddr *)&dest_addr, sizeof(dest_addr));
+      sendto(manager_socket, wire_msg.c_str(), wire_msg.length(), 0,
+             (const struct sockaddr *)&dest_addr, sizeof(dest_addr));
 
-      if (bytes_sent < 0) {
-        std::cerr << "error: Failed to send message.\n";
-      } else {
-        // 6. Block & wait for the manager's pair response
-        char recv_buffer[1024];
-        struct sockaddr_in from_addr;
-        socklen_t from_len = sizeof(from_addr);
+      char recv_buffer[1024];
+      struct sockaddr_in from_addr;
+      socklen_t from_len = sizeof(from_addr);
+      ssize_t bytes_received =
+          recvfrom(manager_socket, recv_buffer, sizeof(recv_buffer) - 1,
+                   MSG_WAITALL, (struct sockaddr *)&from_addr, &from_len);
 
-        ssize_t bytes_received =
-            recvfrom(peer_socket, (char *)recv_buffer, sizeof(recv_buffer) - 1,
-                     MSG_WAITALL, (struct sockaddr *)&from_addr, &from_len);
+      if (bytes_received > 0) {
+        recv_buffer[bytes_received] = '\0';
+        std::string manager_response(recv_buffer);
+        std::cout << "Manager replied: " << manager_response << "\n";
 
-        if (bytes_received > 0) {
-          recv_buffer[bytes_received] = '\0';
-          std::cout << "Manager replied: " << recv_buffer << "\n";
-        } else {
-          std::cerr << "Error: Failed to receive response.\n";
-        }
-        std::cout << "> ";
+        handle_manager_response(wire_msg, manager_response, p_port_socket);
       }
+      std::cout << "> ";
     }
 
-    close(peer_socket);
-  } catch (const std::exception &e) {
-    std::cerr << "Error: Invalid arguments.\n";
-    return EXIT_FAILURE;
+    // --- Handle Incoming P2P Messages ---
+    if (p_port_socket != -1 && FD_ISSET(p_port_socket, &read_fds)) {
+      char p2p_buffer[2048];
+      struct sockaddr_in from_peer_addr;
+      socklen_t from_peer_len = sizeof(from_peer_addr);
+
+      ssize_t p2p_bytes = recvfrom(
+          p_port_socket, p2p_buffer, sizeof(p2p_buffer) - 1, MSG_WAITALL,
+          (struct sockaddr *)&from_peer_addr, &from_peer_len);
+      if (p2p_bytes > 0) {
+        p2p_buffer[p2p_bytes] = '\0';
+        std::cout << "\n[P2P Message Received]: " << p2p_buffer << "\n> ";
+
+        // Future step: Parse set-id and store right neighbor info
+      }
+    }
   }
 
+  close(manager_socket);
+  if (p_port_socket != -1)
+    close(p_port_socket);
   return EXIT_SUCCESS;
 }
