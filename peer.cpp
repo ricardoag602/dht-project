@@ -21,6 +21,20 @@ std::vector<std::string> splitMessage(const std::string &msg, char delimiter) {
   return tokens;
 }
 
+struct PeerEndpoint {
+  std::string name;
+  std::string ip;
+  int p_port;
+};
+
+struct DhtState {
+  bool configured = false;
+  int id = -1;
+  int ring_size = 0;
+  std::vector<PeerEndpoint> peers;
+  PeerEndpoint right_neighbor;
+};
+
 // Helper: Safely bind the P2P socket with error handling
 int setup_p2p_socket(int port) {
   int sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -44,7 +58,8 @@ int setup_p2p_socket(int port) {
 
 // Helper: Process the manager's response and execute subsequent P2P actions
 void handle_manager_response(const std::string &req_msg,
-                             const std::string &resp_msg, int &p_port_socket) {
+                             const std::string &resp_msg, int &p_port_socket,
+                             DhtState &dht_state) {
   std::vector<std::string> req_tokens = splitMessage(req_msg, '|');
   std::vector<std::string> resp_tokens = splitMessage(resp_msg, '|');
 
@@ -66,6 +81,25 @@ void handle_manager_response(const std::string &req_msg,
   // 1]
   if (req_tokens[0] == "setup-dht" && resp_tokens[0] == "SUCCESS") {
     int n = std::stoi(req_tokens[2]);
+    if (resp_tokens.size() != static_cast<size_t>(1 + (3 * n))) {
+      std::cerr << "Invalid setup-dht response: expected " << n
+                << " peer tuples.\n";
+      return;
+    }
+
+    dht_state.configured = true;
+    dht_state.id = 0;
+    dht_state.ring_size = n;
+    dht_state.peers.clear();
+
+    for (int i = 0; i < n; ++i) {
+      int base_idx = 1 + (i * 3);
+      dht_state.peers.push_back(
+          {resp_tokens[base_idx], resp_tokens[base_idx + 1],
+           std::stoi(resp_tokens[base_idx + 2])});
+    }
+    dht_state.right_neighbor = dht_state.peers[1 % n];
+
     std::cout << "Assigned Leader status. Building logical ring of size " << n
               << "...\n";
 
@@ -98,6 +132,39 @@ void handle_manager_response(const std::string &req_msg,
   }
 }
 
+bool handle_set_id(const std::string &msg, DhtState &dht_state) {
+  std::vector<std::string> tokens = splitMessage(msg, '|');
+  if (tokens.size() < 3 || tokens[0] != "set-id")
+    return false;
+
+  int peer_id = std::stoi(tokens[1]);
+  int ring_size = std::stoi(tokens[2]);
+  if (ring_size < 3 || peer_id < 1 || peer_id >= ring_size ||
+      tokens.size() != static_cast<size_t>(3 + (3 * ring_size))) {
+    return false;
+  }
+
+  dht_state.configured = true;
+  dht_state.id = peer_id;
+  dht_state.ring_size = ring_size;
+  dht_state.peers.clear();
+
+  for (int i = 0; i < ring_size; ++i) {
+    int base_idx = 3 + (i * 3);
+    dht_state.peers.push_back(
+        {tokens[base_idx], tokens[base_idx + 1],
+         std::stoi(tokens[base_idx + 2])});
+  }
+  dht_state.right_neighbor = dht_state.peers[(peer_id + 1) % ring_size];
+
+  std::cout << "Configured DHT id=" << dht_state.id
+            << ", ring size=" << dht_state.ring_size << ", right neighbor="
+            << dht_state.right_neighbor.name << " at "
+            << dht_state.right_neighbor.ip << ":"
+            << dht_state.right_neighbor.p_port << "\n";
+  return true;
+}
+
 int main(int argc, char *argv[]) {
   if (argc != 3) {
     std::cerr << "Usage: " << argv[0] << " <manager_ipv4> <manager_port>\n";
@@ -121,6 +188,7 @@ int main(int argc, char *argv[]) {
   inet_pton(AF_INET, manager_ip.c_str(), &dest_addr.sin_addr);
 
   int p_port_socket = -1;
+  DhtState dht_state;
   std::string wire_msg = "";
 
   std::cout << "Peer started. Manager at " << manager_ip << ":" << manager_port
@@ -181,7 +249,8 @@ int main(int argc, char *argv[]) {
         std::string manager_response(recv_buffer);
         std::cout << "Manager replied: " << manager_response << "\n";
 
-        handle_manager_response(wire_msg, manager_response, p_port_socket);
+        handle_manager_response(wire_msg, manager_response, p_port_socket,
+               dht_state);
       }
       std::cout << "> ";
     }
@@ -198,8 +267,9 @@ int main(int argc, char *argv[]) {
       if (p2p_bytes > 0) {
         p2p_buffer[p2p_bytes] = '\0';
         std::cout << "\n[P2P Message Received]: " << p2p_buffer << "\n> ";
-
-        // Future step: Parse set-id and store right neighbor info
+        if (!handle_set_id(p2p_buffer, dht_state)) {
+          std::cerr << "Invalid or unsupported P2P message.\n";
+        }
       }
     }
   }
