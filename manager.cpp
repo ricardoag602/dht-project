@@ -1,31 +1,34 @@
 #include <arpa/inet.h> // IP address conversion function
+#include <algorithm>
 #include <cstdlib>
-#include <cstring> // For memset
+#include <cstring>
 #include <iostream>
-#include <netinet/in.h> // Internet address structures
+#include <netinet/in.h> 
 #include <sstream>
 #include <string>
 #include <sys/socket.h> // Core socket functions
 #include <unistd.h>     // POSIX API access (close function)
 #include <unordered_map>
+#include <random>
 #include <vector>
 
 enum class PeerState { Free, Leader, InDHT };
 
 struct PeerInfo {
-  std::string ip;
-  int m_port;
-  int p_port;
+  std::string ip_address;
+  int manager_port;
+  int peer_port;
   PeerState state;
 };
 
 bool dht_exists = false;
+bool dht_setup_in_progress = false;
 
-// Global map to track peers by their name
+// The manager's state table, indexed by the name supplied during registration.
 std::unordered_map<std::string, PeerInfo> registered_peers;
 
-// Helper: Split incoming delimited strings
-std::vector<std::string> splitMessage(const std::string &msg, char delimiter) {
+// Decode one pipe-delimited command received over UDP.
+std::vector<std::string> split_message(const std::string &msg, char delimiter) {
   std::vector<std::string> tokens;
   std::string token;
   std::istringstream tokenStream(msg);
@@ -35,13 +38,19 @@ std::vector<std::string> splitMessage(const std::string &msg, char delimiter) {
   return tokens;
 }
 
-// Helper: Process commands and generate the manager's response string
-std::string process_command(const std::string &incoming_msg) {
-  std::vector<std::string> tokens = splitMessage(incoming_msg, '|');
+// Validate a command, update manager state, and build its response message.
+std::string process_manager_command(const std::string &incoming_msg) {
+  std::vector<std::string> tokens = split_message(incoming_msg, '|');
   if (tokens.empty())
     return "FAILURE";
 
   std::string command = tokens[0];
+
+  if (dht_setup_in_progress && command != "dht-complete") {
+    std::cout << "Command rejected while DHT setup is in progress: "
+              << command << "\n";
+    return "FAILURE";
+  }
 
   // --- COMMAND: register ---
   if (command == "register" && tokens.size() == 5) {
@@ -68,29 +77,34 @@ std::string process_command(const std::string &incoming_msg) {
     bool is_registered =
         registered_peers.find(peer_name) != registered_peers.end();
 
-    if (!is_registered || n < 3 || registered_peers.size() < n || dht_exists) {
+    if (!is_registered || n < 3 ||
+      registered_peers.size() < static_cast<size_t>(n) || dht_exists) {
       std::cout << "Setup-DHT failed for " << peer_name << ".\n";
       return "FAILURE";
     }
 
     registered_peers[peer_name].state = PeerState::Leader;
     dht_exists = true;
+    dht_setup_in_progress = true;
 
     std::string response = "SUCCESS|" + peer_name + "|" +
-                           registered_peers[peer_name].ip + "|" +
-                           std::to_string(registered_peers[peer_name].p_port);
+                           registered_peers[peer_name].ip_address + "|" +
+                           std::to_string(registered_peers[peer_name].peer_port);
 
-    int peers_added = 1;
-    for (auto &pair : registered_peers) {
-      if (peers_added == n)
-        break; // Stop once we have n peers
+    std::vector<std::string> free_peer_names;
+    for (const auto &pair : registered_peers) {
+      if (pair.first != peer_name && pair.second.state == PeerState::Free)
+        free_peer_names.push_back(pair.first);
+    }
+    std::shuffle(free_peer_names.begin(), free_peer_names.end(),
+                 std::mt19937(std::random_device{}()));
 
-      if (pair.first != peer_name && pair.second.state == PeerState::Free) {
-        pair.second.state = PeerState::InDHT;
-        response += "|" + pair.first + "|" + pair.second.ip + "|" +
-                    std::to_string(pair.second.p_port);
-        peers_added++;
-      }
+    for (int i = 0; i < n - 1; ++i) {
+      const std::string &selected_name = free_peer_names[i];
+      PeerInfo &selected_peer = registered_peers[selected_name];
+      selected_peer.state = PeerState::InDHT;
+      response += "|" + selected_name + "|" + selected_peer.ip_address + "|" +
+                  std::to_string(selected_peer.peer_port);
     }
     std::cout << "DHT Setup complete. Leader: " << peer_name << "\n";
     return response;
@@ -103,8 +117,10 @@ std::string process_command(const std::string &incoming_msg) {
     auto it = registered_peers.find(peer_name);
 
     // Validate that the peer exists and is currently the Leader[cite: 1]
-    if (it != registered_peers.end() && it->second.state == PeerState::Leader) {
+    if (dht_setup_in_progress && it != registered_peers.end() &&
+      it->second.state == PeerState::Leader) {
       std::cout << "DHT Setup completed by Leader: " << peer_name << ".\n";
+      dht_setup_in_progress = false;
       return "SUCCESS";
     }
 
@@ -116,8 +132,8 @@ std::string process_command(const std::string &incoming_msg) {
   return "FAILURE";
 }
 
-// Helper: Configure and bind the UDP socket
-int setup_udp_socket(int manager_port) {
+// Create and bind the UDP socket on which the manager listens.
+int create_manager_socket(int manager_port) {
   int manager_socket = socket(AF_INET, SOCK_DGRAM, 0);
   if (manager_socket < 0)
     return -1;
@@ -146,7 +162,7 @@ int main(int argCount, char *argValue[]) {
     int manager_port = std::stoi(argValue[1]);
     std::cout << "Manager starting on port: " << manager_port << "\n";
 
-    int manager_socket = setup_udp_socket(manager_port);
+    int manager_socket = create_manager_socket(manager_port);
     if (manager_socket < 0) {
       std::cerr << "Error: Socket creation or bind failed.\n";
       return EXIT_FAILURE;
@@ -174,7 +190,7 @@ int main(int argCount, char *argValue[]) {
       std::cout << "Received raw message: " << incoming_msg << "\n";
 
       // Process the command and get the response string
-      std::string response = process_command(incoming_msg);
+      std::string response = process_manager_command(incoming_msg);
 
       // Send SUCCESS or FAILURE back to the peer
       sendto(manager_socket, response.c_str(), response.length(), 0,

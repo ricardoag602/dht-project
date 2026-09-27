@@ -1,0 +1,6 @@
+event_id,state,year,month_name,event_type,cz_type,cz_name,injuries_direct,injuries_indirect,deaths_direct,deaths_indirect,damage_property,damage_crops,tor_f_scale
+1001,TEXAS,1950,January,Tornado,C,TRAVIS,0,0,0,0,10000,0,F1
+1002,ARIZONA,1950,February,Hail,C,MARICOPA,0,0,0,0,5000,0,
+1003,CALIFORNIA,1950,March,Flood,Z,LOS ANGELES,0,0,0,0,20000,0,
+1004,FLORIDA,1950,April,Hurricane,Z,MIAMI,0,0,0,0,50000,0,
+1005,GEORGIA,1950,May,Tornado,C,FULTON,0,0,0,0,15000,0,F2
