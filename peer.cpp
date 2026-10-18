@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
@@ -15,6 +16,7 @@
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -27,6 +29,8 @@ using dht::peer::StormRecord;
 
 constexpr std::size_t kManagerBufferSize = 65536;
 constexpr std::size_t kPeerBufferSize = 65536;
+constexpr std::size_t kStoreWindowSize = 32;
+constexpr auto kStoreRetryInterval = std::chrono::milliseconds(250);
 
 enum class LocalOperation {
   None,
@@ -37,6 +41,12 @@ enum class LocalOperation {
 };
 
 enum class DistributionCompletion { None, InitialSetup, Rebuild };
+
+struct PendingStore {
+  std::string message;
+  std::chrono::steady_clock::time_point last_sent;
+  std::size_t attempts = 1;
+};
 
 struct DhtContext {
   dht::peer::RingState ring;
@@ -59,6 +69,9 @@ struct DhtContext {
   std::unordered_set<int> expected_event_ids;
   std::unordered_set<int> acked_event_ids;
   std::vector<std::size_t> records_per_peer;
+  std::vector<StormRecord> distribution_records;
+  std::size_t next_distribution_record = 0;
+  std::unordered_map<int, PendingStore> in_flight_stores;
   bool setup_active = false;
   bool completion_sent = false;
 };
@@ -347,11 +360,6 @@ bool handle_store_message(const std::string &message, DhtContext &dht_state,
       }
     }
 
-    if (result == DhtStorage::StoreResult::Inserted) {
-      std::cout << "Stored event " << record.event_id << " at position "
-                << *position << " on peer id " << dht_state.ring.local_id()
-                << ".\n";
-    }
     return true;
   }
 
@@ -361,10 +369,6 @@ bool handle_store_message(const std::string &message, DhtContext &dht_state,
     return false;
   }
 
-  const PeerAddress *right_neighbor = dht_state.ring.right_neighbor();
-  std::cout << "Forwarded store for event " << record.event_id
-            << " from peer " << dht_state.ring.local_id() << " to "
-            << right_neighbor->name << ".\n";
   return true;
 }
 
@@ -402,8 +406,15 @@ bool handle_store_ack(const std::string &message, DhtContext &dht_state,
     return false;
   }
 
-  if (dht_state.acked_event_ids.insert(*event_id).second)
+  if (dht_state.acked_event_ids.insert(*event_id).second) {
     ++dht_state.records_per_peer[*destination_id];
+    dht_state.in_flight_stores.erase(*event_id);
+    if (dht_state.acked_event_ids.size() % 1000 == 0 ||
+        dht_state.acked_event_ids.size() == dht_state.total_records) {
+      std::cout << "Distributed " << dht_state.acked_event_ids.size() << "/"
+                << dht_state.total_records << " records.\n";
+    }
+  }
   return true;
 }
 
@@ -429,6 +440,65 @@ bool handle_init_storage(const std::string &message, DhtContext &dht_state,
     return false;
   }
   return send_to_right_neighbor(peer_socket, dht_state, message);
+}
+
+bool pump_record_distribution(DhtContext &dht_state, int peer_socket) {
+  if (!dht_state.setup_active)
+    return true;
+
+  while (dht_state.next_distribution_record <
+             dht_state.distribution_records.size() &&
+         dht_state.in_flight_stores.size() < kStoreWindowSize) {
+    const StormRecord &record =
+        dht_state.distribution_records[dht_state.next_distribution_record];
+    std::optional<int> position =
+        dht_state.storage.position_for(record.event_id);
+    std::optional<int> destination_id =
+        dht_state.storage.owner_for(record.event_id, dht_state.ring.size());
+    if (!position || !destination_id)
+      return false;
+
+    std::string message = build_store_message(
+        *destination_id, *position, dht_state.storage.table_size(), record);
+    if (*destination_id == dht_state.ring.local_id()) {
+      if (!handle_store_message(message, dht_state, peer_socket))
+        return false;
+    } else {
+      if (!send_to_right_neighbor(peer_socket, dht_state, message)) {
+        std::cerr << "Failed to send store for event " << record.event_id
+                  << " to the right neighbor.\n";
+        return false;
+      }
+      dht_state.in_flight_stores.emplace(
+          record.event_id,
+          PendingStore{std::move(message), std::chrono::steady_clock::now(),
+                       1});
+    }
+    ++dht_state.next_distribution_record;
+  }
+  return true;
+}
+
+bool retry_timed_out_stores(DhtContext &dht_state, int peer_socket) {
+  if (!dht_state.setup_active || dht_state.in_flight_stores.empty())
+    return true;
+
+  const auto now = std::chrono::steady_clock::now();
+  for (auto &[event_id, pending] : dht_state.in_flight_stores) {
+    if (now - pending.last_sent < kStoreRetryInterval)
+      continue;
+    if (!send_to_right_neighbor(peer_socket, dht_state, pending.message)) {
+      std::cerr << "Failed to retry store for event " << event_id << ".\n";
+      return false;
+    }
+    pending.last_sent = now;
+    ++pending.attempts;
+    if (pending.attempts == 2 || pending.attempts % 10 == 0) {
+      std::cout << "Retrying unacknowledged event " << event_id
+                << " (attempt " << pending.attempts << ").\n";
+    }
+  }
+  return true;
 }
 
 bool distribute_records(const std::string &year, DhtContext &dht_state,
@@ -459,10 +529,14 @@ bool distribute_records(const std::string &year, DhtContext &dht_state,
   dht_state.expected_event_ids = std::move(event_ids);
   dht_state.acked_event_ids.clear();
   dht_state.records_per_peer.assign(dht_state.ring.size(), 0);
+  dht_state.distribution_records = std::move(records);
+  dht_state.next_distribution_record = 0;
+  dht_state.in_flight_stores.clear();
   dht_state.setup_active = true;
   dht_state.completion_sent = false;
 
-  std::cout << "Loaded " << records.size() << " records from " << path
+  std::cout << "Loaded " << dht_state.distribution_records.size()
+            << " records from " << path
             << "; local hash table size is "
             << dht_state.storage.table_size() << ".\n";
 
@@ -477,27 +551,7 @@ bool distribute_records(const std::string &year, DhtContext &dht_state,
     }
   }
 
-  for (const StormRecord &record : records) {
-    std::optional<int> position =
-        dht_state.storage.position_for(record.event_id);
-    std::optional<int> destination_id =
-        dht_state.storage.owner_for(record.event_id, dht_state.ring.size());
-    if (!position || !destination_id)
-      return false;
-
-    std::string message = build_store_message(
-        *destination_id, *position, dht_state.storage.table_size(), record);
-
-    if (*destination_id == dht_state.ring.local_id()) {
-      if (!handle_store_message(message, dht_state, peer_socket))
-        return false;
-    } else if (!send_to_right_neighbor(peer_socket, dht_state, message)) {
-      std::cerr << "Failed to send store for event " << record.event_id
-                << " to the right neighbor.\n";
-      return false;
-    }
-  }
-  return true;
+  return pump_record_distribution(dht_state, peer_socket);
 }
 
 bool parse_ring_members(const std::vector<std::string> &tokens,
@@ -1059,6 +1113,9 @@ void maybe_report_setup_complete(int manager_socket, int peer_socket,
   dht_state.completion_sent = true;
   dht_state.setup_active = false;
   dht_state.distribution_completion = DistributionCompletion::None;
+  dht_state.distribution_records.clear();
+  dht_state.next_distribution_record = 0;
+  dht_state.in_flight_stores.clear();
 }
 
 } // namespace
@@ -1095,6 +1152,12 @@ int main(int argc, char *argv[]) {
       << "Enter commands (e.g., register <name> <ip> <m-port> <p-port>)\n> ";
 
   while (!dht_state.deregistered) {
+    if (peer_socket != -1 && dht_state.setup_active &&
+        !pump_record_distribution(dht_state, peer_socket)) {
+      std::cerr << "Unable to continue record distribution.\n";
+      break;
+    }
+
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(STDIN_FILENO, &read_fds);
@@ -1106,9 +1169,23 @@ int main(int argc, char *argv[]) {
         max_fd = peer_socket;
     }
 
-    if (select(max_fd + 1, &read_fds, nullptr, nullptr, nullptr) < 0) {
+    timeval retry_timeout{0, 100000};
+    timeval *select_timeout =
+        dht_state.setup_active && !dht_state.in_flight_stores.empty()
+            ? &retry_timeout
+            : nullptr;
+    int ready =
+        select(max_fd + 1, &read_fds, nullptr, nullptr, select_timeout);
+    if (ready < 0) {
       std::cerr << "Error in select multiplexing.\n";
       break;
+    }
+    if (ready == 0) {
+      if (!retry_timed_out_stores(dht_state, peer_socket)) {
+        std::cerr << "Unable to retry record distribution.\n";
+        break;
+      }
+      continue;
     }
 
     if (FD_ISSET(STDIN_FILENO, &read_fds)) {
@@ -1295,7 +1372,10 @@ int main(int argc, char *argv[]) {
       if (peer_bytes > 0) {
         peer_buffer[peer_bytes] = '\0';
         std::string peer_message(peer_buffer);
-        std::cout << "\n[P2P Message Received]: " << peer_message << "\n> ";
+        if (peer_message.rfind("store|", 0) != 0 &&
+            peer_message.rfind("store-ack|", 0) != 0) {
+          std::cout << "\n[P2P Message Received]: " << peer_message << "\n> ";
+        }
 
         bool handled = false;
         if (peer_message.rfind("set-id|", 0) == 0) {
@@ -1330,9 +1410,12 @@ int main(int argc, char *argv[]) {
 
         if (!handled)
           std::cerr << "Invalid or unsupported P2P message.\n";
+        if (!pump_record_distribution(dht_state, peer_socket)) {
+          std::cerr << "Unable to continue record distribution.\n";
+          break;
+        }
         maybe_report_setup_complete(manager_socket, peer_socket,
-                                    manager_endpoint,
-                                    dht_state);
+                                    manager_endpoint, dht_state);
       }
     }
   }

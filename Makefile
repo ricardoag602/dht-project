@@ -22,7 +22,8 @@ TEST_SOURCES := tests/peer_components_test.cpp $(PEER_COMPONENT_SOURCES)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean test manager-test integration-test
+.PHONY: all clean test manager-test integration-test full-dataset-test \
+	deployment-test
 
 all: $(MANAGER_BIN) $(PEER_BIN)
 
@@ -46,6 +47,12 @@ manager-test: $(MANAGER_BIN)
 
 integration-test: all
 	python3 tests/dht_integration_test.py
+
+full-dataset-test: all
+	python3 tests/full_dataset_test.py
+
+# Deployment gate: includes the canonical, complete details-1996.csv workflow.
+deployment-test: test manager-test integration-test full-dataset-test
 
 clean:
 	$(RM) $(MANAGER_BIN) $(PEER_BIN) $(TEST_BIN)
