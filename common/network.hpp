@@ -12,6 +12,9 @@ struct UdpEndpoint {
   int port;
 };
 
+bool is_valid_ipv4(const std::string &ip_address);
+bool is_valid_port(int port);
+
 int create_udp_socket();
 bool bind_udp_socket(int socket_fd, int port);
 int create_bound_udp_socket(int port);

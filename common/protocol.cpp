@@ -32,4 +32,16 @@ std::string join_message(const std::vector<std::string> &fields,
   return message;
 }
 
+std::optional<int> parse_integer(const std::string &value) {
+  try {
+    std::size_t parsed_characters = 0;
+    int parsed_value = std::stoi(value, &parsed_characters);
+    if (parsed_characters != value.size())
+      return std::nullopt;
+    return parsed_value;
+  } catch (const std::exception &) {
+    return std::nullopt;
+  }
+}
+
 } // namespace dht::protocol

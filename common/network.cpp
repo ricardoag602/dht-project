@@ -6,11 +6,12 @@
 
 namespace dht::network {
 
-namespace {
+bool is_valid_ipv4(const std::string &ip_address) {
+  in_addr address;
+  return inet_pton(AF_INET, ip_address.c_str(), &address) == 1;
+}
 
-bool is_valid_port(int port) { return port >= 0 && port <= 65535; }
-
-} // namespace
+bool is_valid_port(int port) { return port >= 1 && port <= 65535; }
 
 int create_udp_socket() { return socket(AF_INET, SOCK_DGRAM, 0); }
 

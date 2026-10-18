@@ -4,9 +4,9 @@
 #include "common/protocol.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <iostream>
-#include <optional>
 #include <random>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -17,16 +17,11 @@ namespace {
 
 constexpr std::size_t kManagerBufferSize = 1024;
 
-std::optional<int> parse_integer(const std::string &value) {
-  try {
-    std::size_t parsed_characters = 0;
-    int parsed_value = std::stoi(value, &parsed_characters);
-    if (parsed_characters != value.size())
-      return std::nullopt;
-    return parsed_value;
-  } catch (const std::exception &) {
-    return std::nullopt;
-  }
+bool is_valid_peer_name(const std::string &name) {
+  return !name.empty() && name.size() <= 15 &&
+         std::all_of(name.begin(), name.end(), [](unsigned char character) {
+           return std::isalpha(character) != 0;
+         });
 }
 
 } // namespace
@@ -103,15 +98,31 @@ std::string Manager::handle_register(const std::vector<std::string> &fields) {
   if (fields.size() != 5)
     return "FAILURE";
 
-  std::optional<int> manager_port = parse_integer(fields[3]);
-  std::optional<int> peer_port = parse_integer(fields[4]);
-  if (!manager_port || !peer_port)
+  std::optional<int> manager_port = protocol::parse_integer(fields[3]);
+  std::optional<int> peer_port = protocol::parse_integer(fields[4]);
+  if (!manager_port || !peer_port ||
+      !network::is_valid_port(*manager_port) ||
+      !network::is_valid_port(*peer_port) || *manager_port == *peer_port ||
+      !network::is_valid_ipv4(fields[2]) ||
+      !is_valid_peer_name(fields[1])) {
     return "FAILURE";
+  }
 
   const std::string &peer_name = fields[1];
   if (registered_peers_.find(peer_name) != registered_peers_.end()) {
     std::cout << "Registration failed: Duplicate name " << peer_name << "\n";
     return "FAILURE";
+  }
+
+  for (const auto &entry : registered_peers_) {
+    const PeerInfo &registered_peer = entry.second;
+    if (*manager_port == registered_peer.manager_port ||
+        *manager_port == registered_peer.peer_port ||
+        *peer_port == registered_peer.manager_port ||
+        *peer_port == registered_peer.peer_port) {
+      std::cout << "Registration failed: Port already registered.\n";
+      return "FAILURE";
+    }
   }
 
   registered_peers_[peer_name] = {
@@ -126,10 +137,13 @@ Manager::handle_setup_dht(const std::vector<std::string> &fields) {
     return "FAILURE";
 
   const std::string &leader_name = fields[1];
-  std::optional<int> ring_size = parse_integer(fields[2]);
+  std::optional<int> ring_size = protocol::parse_integer(fields[2]);
+  std::optional<int> year = protocol::parse_integer(fields[3]);
   auto leader = registered_peers_.find(leader_name);
 
-  if (!ring_size || *ring_size < 3 || leader == registered_peers_.end() ||
+  if (!ring_size || !year || *ring_size < 3 || *year < 1950 || *year > 2019 ||
+      leader == registered_peers_.end() ||
+      leader->second.state != PeerState::Free ||
       registered_peers_.size() < static_cast<std::size_t>(*ring_size) ||
       dht_status_ != DhtStatus::Absent) {
     std::cout << "Setup-DHT failed for " << leader_name << ".\n";
