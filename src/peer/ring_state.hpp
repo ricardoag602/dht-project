@@ -15,6 +15,7 @@ struct PeerAddress {
 class RingState {
 public:
   bool configure(int local_id, std::vector<PeerAddress> members);
+  void clear();
 
   bool configured() const;
   int local_id() const;
@@ -22,6 +23,7 @@ public:
   const PeerAddress *local_peer() const;
   const PeerAddress *right_neighbor() const;
   const PeerAddress *peer_by_id(int peer_id) const;
+  const std::vector<PeerAddress> &members() const;
 
 private:
   int local_id_ = -1;

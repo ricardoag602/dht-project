@@ -24,6 +24,11 @@ bool RingState::configure(int local_id, std::vector<PeerAddress> members) {
   return true;
 }
 
+void RingState::clear() {
+  local_id_ = -1;
+  members_.clear();
+}
+
 bool RingState::configured() const { return local_id_ >= 0; }
 
 int RingState::local_id() const { return local_id_; }
@@ -45,5 +50,7 @@ const PeerAddress *RingState::peer_by_id(int peer_id) const {
     return nullptr;
   return &members_[peer_id];
 }
+
+const std::vector<PeerAddress> &RingState::members() const { return members_; }
 
 } // namespace dht::peer

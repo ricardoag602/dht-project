@@ -4,8 +4,12 @@
 #include "src/peer/ring_state.hpp"
 #include "src/peer/storm_record.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdlib>
 #include <iostream>
+#include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <sys/select.h>
@@ -21,12 +25,34 @@ using dht::peer::DhtStorage;
 using dht::peer::PeerAddress;
 using dht::peer::StormRecord;
 
-constexpr std::size_t kManagerBufferSize = 1024;
+constexpr std::size_t kManagerBufferSize = 65536;
 constexpr std::size_t kPeerBufferSize = 65536;
+
+enum class LocalOperation {
+  None,
+  Leaving,
+  Joining,
+  JoinLeader,
+  TearingDown
+};
+
+enum class DistributionCompletion { None, InitialSetup, Rebuild };
 
 struct DhtContext {
   dht::peer::RingState ring;
   DhtStorage storage;
+
+  std::string local_name;
+  std::string local_ip_address;
+  int local_peer_port = 0;
+  std::string dataset_year;
+  std::optional<PeerAddress> query_target;
+  LocalOperation operation = LocalOperation::None;
+  DistributionCompletion distribution_completion =
+      DistributionCompletion::None;
+  std::vector<PeerAddress> pending_members;
+  std::optional<PeerAddress> rebuild_coordinator;
+  bool deregistered = false;
 
   // The leader uses these fields to decide when setup is actually complete.
   std::size_t total_records = 0;
@@ -36,6 +62,13 @@ struct DhtContext {
   bool setup_active = false;
   bool completion_sent = false;
 };
+
+constexpr std::array<const char *, dht::peer::kStormFieldCount>
+    kStormFieldLabels{"event id",         "state",          "year",
+                      "month name",       "event type",     "cz type",
+                      "cz name",          "injuries direct", "injuries indirect",
+                      "deaths direct",    "deaths indirect", "damage property",
+                      "damage crops",     "tor f scale"};
 
 std::string build_store_message(int destination_id, int position,
                                 int hash_table_size,
@@ -60,11 +93,185 @@ bool send_to_right_neighbor(int socket_fd, const DhtContext &dht_state,
          send_peer_message(socket_fd, *right_neighbor, message);
 }
 
+std::string join_ids(const std::vector<int> &ids) {
+  std::vector<std::string> fields;
+  fields.reserve(ids.size());
+  for (int id : ids)
+    fields.push_back(std::to_string(id));
+  return dht::protocol::join_message(fields, ',');
+}
+
+bool parse_ids(const std::string &value, int ring_size,
+               std::vector<int> &ids) {
+  std::vector<int> parsed;
+  std::unordered_set<int> unique;
+  if (!value.empty()) {
+    for (const std::string &field :
+         dht::protocol::split_message(value, ',')) {
+      std::optional<int> id = dht::protocol::parse_integer(field);
+      if (!id || *id < 0 || *id >= ring_size || !unique.insert(*id).second)
+        return false;
+      parsed.push_back(*id);
+    }
+  }
+  ids = std::move(parsed);
+  return true;
+}
+
+bool send_find_result(int peer_socket, const std::string &requester_ip,
+                      int requester_port, int event_id,
+                      const std::vector<int> &visited,
+                      const StormRecord *record) {
+  std::vector<std::string> fields{"find-result",
+                                  record ? "SUCCESS" : "FAILURE",
+                                  std::to_string(event_id), join_ids(visited)};
+  if (record)
+    fields.insert(fields.end(), record->fields.begin(), record->fields.end());
+  return dht::network::send_udp_message(
+      peer_socket, {requester_ip, requester_port},
+      dht::protocol::join_message(fields));
+}
+
+bool handle_find_event(const std::string &message, DhtContext &dht_state,
+                       int peer_socket) {
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
+  if (tokens.size() != 6 || tokens[0] != "find-event" ||
+      !dht_state.ring.configured() || !dht_state.storage.initialized()) {
+    return false;
+  }
+
+  std::optional<int> event_id = dht::protocol::parse_integer(tokens[1]);
+  std::optional<int> requester_port =
+      dht::protocol::parse_integer(tokens[4]);
+  std::vector<int> visited;
+  if (!event_id || *event_id < 0 || !requester_port ||
+      !dht::network::is_valid_port(*requester_port) ||
+      !dht::network::is_valid_ipv4(tokens[3]) ||
+      !parse_ids(tokens[5], dht_state.ring.size(), visited)) {
+    return false;
+  }
+
+  const int local_id = dht_state.ring.local_id();
+  if (std::find(visited.begin(), visited.end(), local_id) == visited.end())
+    visited.push_back(local_id);
+
+  const StormRecord *record = dht_state.storage.find(*event_id);
+  if (record) {
+    std::cout << "Found event " << *event_id << " on peer id " << local_id
+              << "; returning it to " << tokens[2] << ".\n";
+    return send_find_result(peer_socket, tokens[3], *requester_port,
+                            *event_id, visited, record);
+  }
+
+  std::vector<int> candidates;
+  for (int peer_id = 0; peer_id < dht_state.ring.size(); ++peer_id) {
+    if (std::find(visited.begin(), visited.end(), peer_id) == visited.end())
+      candidates.push_back(peer_id);
+  }
+
+  if (candidates.empty()) {
+    std::cout << "Event " << *event_id
+              << " was not found after probing every peer.\n";
+    return send_find_result(peer_socket, tokens[3], *requester_port,
+                            *event_id, visited, nullptr);
+  }
+
+  std::mt19937 generator(std::random_device{}());
+  std::uniform_int_distribution<std::size_t> distribution(
+      0, candidates.size() - 1);
+  int next_id = candidates[distribution(generator)];
+  const PeerAddress *next_peer = dht_state.ring.peer_by_id(next_id);
+  if (!next_peer)
+    return false;
+
+  tokens[5] = join_ids(visited);
+  std::cout << "Hot-potato query for event " << *event_id << " moved from id "
+            << local_id << " to id " << next_id << ".\n";
+  return send_peer_message(peer_socket, *next_peer,
+                           dht::protocol::join_message(tokens));
+}
+
+bool handle_find_result(const std::string &message) {
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
+  if (tokens.size() < 4 || tokens[0] != "find-result")
+    return false;
+
+  std::optional<int> event_id = dht::protocol::parse_integer(tokens[2]);
+  if (!event_id || *event_id < 0)
+    return false;
+
+  if (tokens[1] == "FAILURE" && tokens.size() == 4) {
+    std::cout << "Storm event " << *event_id << " not found in the DHT.\n";
+    std::cout << "id-seq: " << tokens[3] << "\n";
+    return true;
+  }
+
+  if (tokens[1] != "SUCCESS" ||
+      tokens.size() != 4 + dht::peer::kStormFieldCount ||
+      tokens[4] != tokens[2]) {
+    return false;
+  }
+
+  std::cout << "Storm event " << *event_id << " found:\n";
+  for (std::size_t index = 0; index < dht::peer::kStormFieldCount; ++index)
+    std::cout << "  " << kStormFieldLabels[index] << ": " << tokens[4 + index]
+              << "\n";
+  std::cout << "id-seq: " << tokens[3] << "\n";
+  return true;
+}
+
 bool recreate_manager_socket(int &manager_socket) {
   if (manager_socket >= 0)
     close(manager_socket);
   manager_socket = dht::network::create_udp_socket();
   return manager_socket >= 0;
+}
+
+std::optional<std::string>
+exchange_with_manager(int manager_socket,
+                      const dht::network::UdpEndpoint &manager,
+                      const std::string &message) {
+  if (!dht::network::send_udp_message(manager_socket, manager, message))
+    return std::nullopt;
+
+  char buffer[kManagerBufferSize];
+  sockaddr_in response_address;
+  socklen_t response_length = sizeof(response_address);
+  ssize_t bytes_received =
+      recvfrom(manager_socket, buffer, sizeof(buffer) - 1, MSG_WAITALL,
+               reinterpret_cast<sockaddr *>(&response_address),
+               &response_length);
+  if (bytes_received <= 0)
+    return std::nullopt;
+
+  buffer[bytes_received] = '\0';
+  return std::string(buffer);
+}
+
+std::vector<std::string>
+ring_member_fields(const std::vector<PeerAddress> &members) {
+  std::vector<std::string> fields;
+  fields.reserve(members.size() * 3);
+  for (const PeerAddress &member : members) {
+    fields.push_back(member.name);
+    fields.push_back(member.ip_address);
+    fields.push_back(std::to_string(member.peer_port));
+  }
+  return fields;
+}
+
+bool same_members(const std::vector<PeerAddress> &left,
+                  const std::vector<PeerAddress> &right) {
+  if (left.size() != right.size())
+    return false;
+  for (std::size_t index = 0; index < left.size(); ++index) {
+    if (left[index].name != right[index].name ||
+        left[index].ip_address != right[index].ip_address ||
+        left[index].peer_port != right[index].peer_port) {
+      return false;
+    }
+  }
+  return true;
 }
 
 bool handle_store_message(const std::string &message, DhtContext &dht_state,
@@ -200,6 +407,30 @@ bool handle_store_ack(const std::string &message, DhtContext &dht_state,
   return true;
 }
 
+bool handle_init_storage(const std::string &message, DhtContext &dht_state,
+                         int peer_socket) {
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
+  if (tokens.size() != 3 || tokens[0] != "init-storage" ||
+      !dht_state.ring.configured()) {
+    return false;
+  }
+
+  std::optional<int> table_size = dht::protocol::parse_integer(tokens[1]);
+  if (!table_size || *table_size <= 0)
+    return false;
+
+  if (dht_state.local_name == tokens[2])
+    return dht_state.ring.local_id() == 0;
+
+  if (!dht_state.storage.initialized()) {
+    if (!dht_state.storage.initialize(*table_size))
+      return false;
+  } else if (dht_state.storage.table_size() != *table_size) {
+    return false;
+  }
+  return send_to_right_neighbor(peer_socket, dht_state, message);
+}
+
 bool distribute_records(const std::string &year, DhtContext &dht_state,
                         int peer_socket) {
   std::vector<StormRecord> records;
@@ -234,6 +465,17 @@ bool distribute_records(const std::string &year, DhtContext &dht_state,
   std::cout << "Loaded " << records.size() << " records from " << path
             << "; local hash table size is "
             << dht_state.storage.table_size() << ".\n";
+
+  if (dht_state.ring.size() > 1) {
+    std::string initialize_message = dht::protocol::join_message(
+        {"init-storage", std::to_string(dht_state.storage.table_size()),
+         dht_state.local_name});
+    if (!send_to_right_neighbor(peer_socket, dht_state,
+                                initialize_message)) {
+      std::cerr << "Failed to initialize storage around the ring.\n";
+      return false;
+    }
+  }
 
   for (const StormRecord &record : records) {
     std::optional<int> position =
@@ -282,6 +524,276 @@ bool parse_ring_members(const std::vector<std::string> &tokens,
   return true;
 }
 
+std::string build_reset_message(const std::string &mode,
+                                const PeerAddress &coordinator,
+                                const std::string &year, int next_id,
+                                const std::vector<PeerAddress> &members) {
+  std::vector<std::string> fields{
+      "reset-id", mode, coordinator.name, coordinator.ip_address,
+      std::to_string(coordinator.peer_port), year, std::to_string(next_id),
+      std::to_string(members.size())};
+  std::vector<std::string> member_fields = ring_member_fields(members);
+  fields.insert(fields.end(), member_fields.begin(), member_fields.end());
+  return dht::protocol::join_message(fields);
+}
+
+bool start_rebuild(const std::string &year, const PeerAddress &coordinator,
+                   const std::vector<PeerAddress> &members,
+                   DhtContext &dht_state, int peer_socket) {
+  if (!dht_state.ring.configured() || dht_state.ring.local_id() != 0 ||
+      !same_members(dht_state.ring.members(), members)) {
+    return false;
+  }
+
+  dht_state.dataset_year = year;
+  dht_state.rebuild_coordinator = coordinator;
+  dht_state.distribution_completion = DistributionCompletion::Rebuild;
+  dht_state.operation = LocalOperation::None;
+  if (!distribute_records(year, dht_state, peer_socket)) {
+    dht_state.distribution_completion = DistributionCompletion::None;
+    return false;
+  }
+  std::cout << "Rebuilding the DHT as leader " << dht_state.local_name
+            << ".\n";
+  return true;
+}
+
+bool handle_reset_id(const std::string &message, DhtContext &dht_state,
+                     int peer_socket) {
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
+  constexpr std::size_t member_start = 8;
+  if (tokens.size() < member_start || tokens[0] != "reset-id" ||
+      (tokens[1] != "leave" && tokens[1] != "join")) {
+    return false;
+  }
+
+  std::optional<int> coordinator_port =
+      dht::protocol::parse_integer(tokens[4]);
+  std::optional<int> next_id = dht::protocol::parse_integer(tokens[6]);
+  std::optional<int> ring_size = dht::protocol::parse_integer(tokens[7]);
+  if (!coordinator_port ||
+      !dht::network::is_valid_port(*coordinator_port) ||
+      !dht::network::is_valid_ipv4(tokens[3]) || !next_id || !ring_size ||
+      *ring_size < 1 || *next_id < 0 || *next_id > *ring_size) {
+    return false;
+  }
+
+  PeerAddress coordinator{tokens[2], tokens[3], *coordinator_port};
+  std::vector<PeerAddress> members;
+  if (!parse_ring_members(tokens, member_start, *ring_size, members))
+    return false;
+
+  dht_state.pending_members = members;
+  if (*next_id < *ring_size) {
+    if (members[*next_id].name != dht_state.local_name ||
+        !dht_state.ring.configure(*next_id, members)) {
+      return false;
+    }
+    dht_state.storage.clear();
+    std::cout << "Reset DHT id to " << *next_id << " of " << *ring_size
+              << ".\n";
+
+    int following_id = *next_id + 1;
+    tokens[6] = std::to_string(following_id);
+    const PeerAddress &destination =
+        following_id < *ring_size
+            ? members[following_id]
+            : (tokens[1] == "leave" ? coordinator : members[0]);
+    return send_peer_message(peer_socket, destination,
+                             dht::protocol::join_message(tokens));
+  }
+
+  if (tokens[1] == "leave") {
+    if (dht_state.operation != LocalOperation::Leaving ||
+        dht_state.local_name != coordinator.name) {
+      return false;
+    }
+    dht_state.ring.clear();
+    std::vector<std::string> rebuild_fields{
+        "rebuild-dht", tokens[5], coordinator.name, coordinator.ip_address,
+        std::to_string(coordinator.peer_port), std::to_string(*ring_size)};
+    std::vector<std::string> member_fields = ring_member_fields(members);
+    rebuild_fields.insert(rebuild_fields.end(), member_fields.begin(),
+                          member_fields.end());
+    std::cout << "Ring identifiers reset; asking " << members[0].name
+              << " to rebuild the DHT.\n";
+    return send_peer_message(peer_socket, members[0],
+                             dht::protocol::join_message(rebuild_fields));
+  }
+
+  if (dht_state.local_name != members[0].name)
+    return false;
+  return start_rebuild(tokens[5], coordinator, members, dht_state,
+                       peer_socket);
+}
+
+bool handle_rebuild_dht(const std::string &message, DhtContext &dht_state,
+                        int peer_socket) {
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
+  constexpr std::size_t member_start = 6;
+  if (tokens.size() < member_start || tokens[0] != "rebuild-dht")
+    return false;
+
+  std::optional<int> coordinator_port =
+      dht::protocol::parse_integer(tokens[4]);
+  std::optional<int> ring_size = dht::protocol::parse_integer(tokens[5]);
+  if (!coordinator_port ||
+      !dht::network::is_valid_port(*coordinator_port) ||
+      !dht::network::is_valid_ipv4(tokens[3]) || !ring_size ||
+      *ring_size < 1) {
+    return false;
+  }
+
+  std::vector<PeerAddress> members;
+  if (!parse_ring_members(tokens, member_start, *ring_size, members) ||
+      members[0].name != dht_state.local_name) {
+    return false;
+  }
+  return start_rebuild(tokens[1],
+                       PeerAddress{tokens[2], tokens[3], *coordinator_port},
+                       members, dht_state, peer_socket);
+}
+
+bool handle_rebuild_complete(
+    const std::string &message, DhtContext &dht_state, int manager_socket,
+    const dht::network::UdpEndpoint &manager_endpoint) {
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
+  if (tokens.size() != 2 || tokens[0] != "rebuild-complete" ||
+      (dht_state.operation != LocalOperation::Leaving &&
+       dht_state.operation != LocalOperation::Joining) ||
+      dht_state.pending_members.empty() ||
+      tokens[1] != dht_state.pending_members[0].name) {
+    return false;
+  }
+
+  std::string command = dht::protocol::join_message(
+      {"dht-rebuilt", dht_state.local_name, tokens[1]});
+  std::optional<std::string> response = exchange_with_manager(
+      manager_socket, manager_endpoint, command);
+  if (!response) {
+    std::cerr << "Unable to report dht-rebuilt to the manager.\n";
+    return false;
+  }
+  std::cout << "Manager replied: " << *response << "\n";
+  if (*response != "SUCCESS")
+    return false;
+
+  if (dht_state.operation == LocalOperation::Leaving)
+    std::cout << dht_state.local_name << " is now Free.\n";
+  else
+    std::cout << dht_state.local_name << " joined the rebuilt DHT.\n";
+  dht_state.operation = LocalOperation::None;
+  dht_state.rebuild_coordinator.reset();
+  return true;
+}
+
+bool handle_teardown(const std::string &message, DhtContext &dht_state,
+                     int peer_socket, int manager_socket,
+                     const dht::network::UdpEndpoint &manager_endpoint) {
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
+  if (tokens.size() != 3 || tokens[0] != "teardown" ||
+      (tokens[1] != "leave" && tokens[1] != "join" &&
+       tokens[1] != "delete") ||
+      !dht_state.ring.configured()) {
+    return false;
+  }
+
+  if (tokens[2] != dht_state.local_name) {
+    dht_state.storage.clear();
+    std::cout << "Cleared local DHT for " << tokens[1] << " operation.\n";
+    bool forwarded = send_to_right_neighbor(peer_socket, dht_state, message);
+    if (forwarded)
+      dht_state.ring.clear();
+    return forwarded;
+  }
+
+  dht_state.storage.clear();
+  if (tokens[1] == "delete") {
+    if (dht_state.operation != LocalOperation::TearingDown)
+      return false;
+    dht_state.ring.clear();
+    std::optional<std::string> response = exchange_with_manager(
+        manager_socket, manager_endpoint,
+        dht::protocol::join_message(
+            {"teardown-complete", dht_state.local_name}));
+    if (!response) {
+      std::cerr << "Unable to report teardown-complete to the manager.\n";
+      return false;
+    }
+    std::cout << "Manager replied: " << *response << "\n";
+    if (*response != "SUCCESS")
+      return false;
+    dht_state.operation = LocalOperation::None;
+    dht_state.dataset_year.clear();
+    std::cout << "DHT teardown completed.\n";
+    return true;
+  }
+
+  if (tokens[1] == "leave") {
+    if (dht_state.operation != LocalOperation::Leaving ||
+        dht_state.pending_members.empty()) {
+      return false;
+    }
+    PeerAddress coordinator{dht_state.local_name,
+                            dht_state.local_ip_address,
+                            dht_state.local_peer_port};
+    return send_peer_message(
+        peer_socket, dht_state.pending_members[0],
+        build_reset_message("leave", coordinator, dht_state.dataset_year, 0,
+                            dht_state.pending_members));
+  }
+
+  if (dht_state.operation != LocalOperation::JoinLeader ||
+      dht_state.pending_members.empty() || !dht_state.rebuild_coordinator ||
+      dht_state.pending_members[0].name != dht_state.local_name ||
+      !dht_state.ring.configure(0, dht_state.pending_members)) {
+    return false;
+  }
+
+  if (dht_state.pending_members.size() == 1) {
+    return start_rebuild(dht_state.dataset_year,
+                         *dht_state.rebuild_coordinator,
+                         dht_state.pending_members, dht_state, peer_socket);
+  }
+  return send_peer_message(
+      peer_socket, dht_state.pending_members[1],
+      build_reset_message("join", *dht_state.rebuild_coordinator,
+                          dht_state.dataset_year, 1,
+                          dht_state.pending_members));
+}
+
+bool handle_join_request(const std::string &message, DhtContext &dht_state,
+                         int peer_socket) {
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
+  if (tokens.size() != 5 || tokens[0] != "join-request" ||
+      !dht_state.ring.configured() || dht_state.ring.local_id() != 0 ||
+      dht_state.operation != LocalOperation::None) {
+    return false;
+  }
+
+  std::optional<int> peer_port = dht::protocol::parse_integer(tokens[3]);
+  if (!peer_port || !dht::network::is_valid_port(*peer_port) ||
+      !dht::network::is_valid_ipv4(tokens[2])) {
+    return false;
+  }
+  for (const PeerAddress &member : dht_state.ring.members()) {
+    if (member.name == tokens[1])
+      return false;
+  }
+
+  PeerAddress joining_peer{tokens[1], tokens[2], *peer_port};
+  dht_state.pending_members = dht_state.ring.members();
+  dht_state.pending_members.push_back(joining_peer);
+  dht_state.rebuild_coordinator = joining_peer;
+  dht_state.dataset_year = tokens[4];
+  dht_state.operation = LocalOperation::JoinLeader;
+  std::cout << "Starting ring rebuild to add " << joining_peer.name << ".\n";
+  return send_to_right_neighbor(
+      peer_socket, dht_state,
+      dht::protocol::join_message(
+          {"teardown", "join", dht_state.local_name}));
+}
+
 void handle_manager_response(const std::string &request_message,
                              const std::string &response_message,
                              int peer_socket, DhtContext &dht_state) {
@@ -292,6 +804,125 @@ void handle_manager_response(const std::string &request_message,
 
   if (request_tokens.empty() || response_tokens.empty())
     return;
+
+  if (request_tokens[0] == "register" && request_tokens.size() == 5 &&
+      response_tokens.size() == 1 && response_tokens[0] == "SUCCESS") {
+    std::optional<int> peer_port =
+        dht::protocol::parse_integer(request_tokens[4]);
+    if (peer_port) {
+      dht_state.local_name = request_tokens[1];
+      dht_state.local_ip_address = request_tokens[2];
+      dht_state.local_peer_port = *peer_port;
+    }
+    return;
+  }
+
+  if (request_tokens[0] == "deregister" && request_tokens.size() == 2 &&
+      response_tokens.size() == 1 && response_tokens[0] == "SUCCESS") {
+    dht_state.deregistered = true;
+    std::cout << "Deregistered successfully; peer is exiting.\n";
+    return;
+  }
+
+  if (request_tokens[0] == "query-dht" && request_tokens.size() == 2 &&
+      response_tokens.size() == 4 && response_tokens[0] == "SUCCESS") {
+    std::optional<int> peer_port =
+        dht::protocol::parse_integer(response_tokens[3]);
+    if (!peer_port || !dht::network::is_valid_port(*peer_port) ||
+        !dht::network::is_valid_ipv4(response_tokens[2])) {
+      std::cerr << "Manager returned an invalid DHT query target.\n";
+      return;
+    }
+    dht_state.query_target =
+        PeerAddress{response_tokens[1], response_tokens[2], *peer_port};
+    std::cout << "Query entry point: " << response_tokens[1] << " at "
+              << response_tokens[2] << ":" << *peer_port
+              << ". Enter find-event <event-id>.\n";
+    return;
+  }
+
+  if (request_tokens[0] == "leave-dht" && request_tokens.size() == 2 &&
+      response_tokens.size() == 2 && response_tokens[0] == "SUCCESS") {
+    if (!dht_state.ring.configured() ||
+        request_tokens[1] != dht_state.local_name ||
+        dht_state.ring.size() <= 1) {
+      std::cerr << "Cannot begin leave: local ring state is invalid.\n";
+      return;
+    }
+
+    dht_state.dataset_year = response_tokens[1];
+    dht_state.pending_members.clear();
+    for (int offset = 1; offset < dht_state.ring.size(); ++offset) {
+      int member_id =
+          (dht_state.ring.local_id() + offset) % dht_state.ring.size();
+      const PeerAddress *member = dht_state.ring.peer_by_id(member_id);
+      if (!member)
+        return;
+      dht_state.pending_members.push_back(*member);
+    }
+    dht_state.operation = LocalOperation::Leaving;
+    if (!send_to_right_neighbor(
+            peer_socket, dht_state,
+            dht::protocol::join_message(
+                {"teardown", "leave", dht_state.local_name}))) {
+      std::cerr << "Unable to start leave teardown around the ring.\n";
+      return;
+    }
+    std::cout << "Leave accepted; tearing down the old DHT.\n";
+    return;
+  }
+
+  if (request_tokens[0] == "join-dht" && request_tokens.size() == 2 &&
+      response_tokens.size() >= 3 && response_tokens[0] == "SUCCESS") {
+    std::optional<int> ring_size =
+        dht::protocol::parse_integer(response_tokens[2]);
+    std::vector<PeerAddress> current_members;
+    if (!ring_size || *ring_size < 1 ||
+        !parse_ring_members(response_tokens, 3, *ring_size,
+                            current_members) ||
+        request_tokens[1] != dht_state.local_name) {
+      std::cerr << "Manager returned invalid join configuration.\n";
+      return;
+    }
+
+    PeerAddress local_peer{dht_state.local_name,
+                           dht_state.local_ip_address,
+                           dht_state.local_peer_port};
+    dht_state.dataset_year = response_tokens[1];
+    dht_state.pending_members = current_members;
+    dht_state.pending_members.push_back(local_peer);
+    dht_state.operation = LocalOperation::Joining;
+    std::string join_request = dht::protocol::join_message(
+        {"join-request", local_peer.name, local_peer.ip_address,
+         std::to_string(local_peer.peer_port), dht_state.dataset_year});
+    if (!send_peer_message(peer_socket, current_members[0], join_request)) {
+      std::cerr << "Unable to send join request to the DHT leader.\n";
+      return;
+    }
+    std::cout << "Join accepted; asked leader " << current_members[0].name
+              << " to rebuild the ring.\n";
+    return;
+  }
+
+  if (request_tokens[0] == "teardown-dht" && request_tokens.size() == 2 &&
+      response_tokens.size() == 1 && response_tokens[0] == "SUCCESS") {
+    if (!dht_state.ring.configured() ||
+        dht_state.ring.local_id() != 0 ||
+        request_tokens[1] != dht_state.local_name) {
+      std::cerr << "Cannot begin teardown: this peer is not the leader.\n";
+      return;
+    }
+    dht_state.operation = LocalOperation::TearingDown;
+    if (!send_to_right_neighbor(
+            peer_socket, dht_state,
+            dht::protocol::join_message(
+                {"teardown", "delete", dht_state.local_name}))) {
+      std::cerr << "Unable to start DHT teardown around the ring.\n";
+      return;
+    }
+    std::cout << "Teardown accepted; deleting the DHT around the ring.\n";
+    return;
+  }
 
   if (request_tokens[0] != "setup-dht" || response_tokens[0] != "SUCCESS")
     return;
@@ -318,6 +949,8 @@ void handle_manager_response(const std::string &request_message,
   }
 
   dht_state.storage.clear();
+  dht_state.dataset_year = request_tokens[3];
+  dht_state.distribution_completion = DistributionCompletion::InitialSetup;
   std::cout << "Assigned Leader status. Building logical ring of size "
             << *ring_size << "...\n";
 
@@ -377,7 +1010,7 @@ bool handle_set_id(const std::string &message, DhtContext &dht_state) {
   return true;
 }
 
-void maybe_report_setup_complete(int manager_socket,
+void maybe_report_setup_complete(int manager_socket, int peer_socket,
                                  const dht::network::UdpEndpoint &manager,
                                  DhtContext &dht_state) {
   if (!dht_state.ring.configured() || dht_state.ring.local_id() != 0 ||
@@ -389,40 +1022,43 @@ void maybe_report_setup_complete(int manager_socket,
   const PeerAddress *local_peer = dht_state.ring.local_peer();
   if (!local_peer)
     return;
-
-  std::string completion_message = "dht-complete|" + local_peer->name;
-  if (!dht::network::send_udp_message(manager_socket, manager,
-                                      completion_message)) {
-    std::cerr << "Unable to send dht-complete to the manager.\n";
-    return;
-  }
-
-  char completion_buffer[kManagerBufferSize];
-  sockaddr_in completion_address;
-  socklen_t completion_length = sizeof(completion_address);
-  ssize_t completion_bytes =
-      recvfrom(manager_socket, completion_buffer, sizeof(completion_buffer) - 1,
-               MSG_WAITALL,
-               reinterpret_cast<sockaddr *>(&completion_address),
-               &completion_length);
-  if (completion_bytes <= 0) {
-    std::cerr << "Unable to receive the dht-complete response.\n";
-    return;
-  }
-
-  completion_buffer[completion_bytes] = '\0';
-  std::string completion_response(completion_buffer);
-  std::cout << "Manager replied: " << completion_response << "\n";
-  if (completion_response != "SUCCESS")
-    return;
-
-  dht_state.completion_sent = true;
-  dht_state.setup_active = false;
   for (std::size_t peer_id = 0; peer_id < dht_state.records_per_peer.size();
        ++peer_id) {
     std::cout << "Peer id " << peer_id << " stored "
               << dht_state.records_per_peer[peer_id] << " records.\n";
   }
+
+  if (dht_state.distribution_completion ==
+      DistributionCompletion::InitialSetup) {
+    std::optional<std::string> response = exchange_with_manager(
+        manager_socket, manager,
+        dht::protocol::join_message({"dht-complete", local_peer->name}));
+    if (!response) {
+      std::cerr << "Unable to exchange dht-complete with the manager.\n";
+      return;
+    }
+    std::cout << "Manager replied: " << *response << "\n";
+    if (*response != "SUCCESS")
+      return;
+  } else if (dht_state.distribution_completion ==
+             DistributionCompletion::Rebuild) {
+    if (!dht_state.rebuild_coordinator ||
+        !send_peer_message(
+            peer_socket, *dht_state.rebuild_coordinator,
+            dht::protocol::join_message(
+                {"rebuild-complete", local_peer->name}))) {
+      std::cerr << "Unable to signal rebuild completion to the coordinator.\n";
+      return;
+    }
+    std::cout << "Signalled rebuilt DHT completion to "
+              << dht_state.rebuild_coordinator->name << ".\n";
+  } else {
+    return;
+  }
+
+  dht_state.completion_sent = true;
+  dht_state.setup_active = false;
+  dht_state.distribution_completion = DistributionCompletion::None;
 }
 
 } // namespace
@@ -458,7 +1094,7 @@ int main(int argc, char *argv[]) {
   std::cout
       << "Enter commands (e.g., register <name> <ip> <m-port> <p-port>)\n> ";
 
-  while (true) {
+  while (!dht_state.deregistered) {
     fd_set read_fds;
     FD_ZERO(&read_fds);
     FD_SET(STDIN_FILENO, &read_fds);
@@ -495,6 +1131,34 @@ int main(int argc, char *argv[]) {
           dht::protocol::join_message(command_fields);
       std::vector<std::string> request_tokens =
           dht::protocol::split_message(wire_message);
+
+      if (!request_tokens.empty() && request_tokens[0] == "find-event") {
+        if (request_tokens.size() != 2) {
+          std::cerr << "Usage: find-event <event-id>\n> ";
+          continue;
+        }
+        std::optional<int> event_id =
+            dht::protocol::parse_integer(request_tokens[1]);
+        if (!event_id || *event_id < 0 || dht_state.local_name.empty() ||
+            !dht_state.query_target) {
+          std::cerr << "Run a successful query-dht before find-event.\n> ";
+          continue;
+        }
+
+        std::vector<std::string> query_fields{
+            "find-event", request_tokens[1], dht_state.local_name,
+            dht_state.local_ip_address,
+            std::to_string(dht_state.local_peer_port), ""};
+        if (!send_peer_message(peer_socket, *dht_state.query_target,
+                               dht::protocol::join_message(query_fields))) {
+          std::cerr << "Unable to send find-event to the DHT entry point.\n> ";
+          continue;
+        }
+        std::cout << "Sent find-event for " << *event_id << " to "
+                  << dht_state.query_target->name << ".\n> ";
+        dht_state.query_target.reset();
+        continue;
+      }
 
       int pending_peer_socket = -1;
       bool pending_registration = false;
@@ -605,7 +1269,8 @@ int main(int argc, char *argv[]) {
 
         handle_manager_response(wire_message, manager_response, peer_socket,
                                 dht_state);
-        maybe_report_setup_complete(manager_socket, manager_endpoint,
+        maybe_report_setup_complete(manager_socket, peer_socket,
+                                    manager_endpoint,
                                     dht_state);
       } else if (pending_peer_socket >= 0) {
         close(pending_peer_socket);
@@ -640,11 +1305,33 @@ int main(int argc, char *argv[]) {
               handle_store_message(peer_message, dht_state, peer_socket);
         } else if (peer_message.rfind("store-ack|", 0) == 0) {
           handled = handle_store_ack(peer_message, dht_state, peer_socket);
+        } else if (peer_message.rfind("init-storage|", 0) == 0) {
+          handled =
+              handle_init_storage(peer_message, dht_state, peer_socket);
+        } else if (peer_message.rfind("find-event|", 0) == 0) {
+          handled = handle_find_event(peer_message, dht_state, peer_socket);
+        } else if (peer_message.rfind("find-result|", 0) == 0) {
+          handled = handle_find_result(peer_message);
+        } else if (peer_message.rfind("join-request|", 0) == 0) {
+          handled =
+              handle_join_request(peer_message, dht_state, peer_socket);
+        } else if (peer_message.rfind("teardown|", 0) == 0) {
+          handled = handle_teardown(peer_message, dht_state, peer_socket,
+                                    manager_socket, manager_endpoint);
+        } else if (peer_message.rfind("reset-id|", 0) == 0) {
+          handled = handle_reset_id(peer_message, dht_state, peer_socket);
+        } else if (peer_message.rfind("rebuild-dht|", 0) == 0) {
+          handled =
+              handle_rebuild_dht(peer_message, dht_state, peer_socket);
+        } else if (peer_message.rfind("rebuild-complete|", 0) == 0) {
+          handled = handle_rebuild_complete(
+              peer_message, dht_state, manager_socket, manager_endpoint);
         }
 
         if (!handled)
           std::cerr << "Invalid or unsupported P2P message.\n";
-        maybe_report_setup_complete(manager_socket, manager_endpoint,
+        maybe_report_setup_complete(manager_socket, peer_socket,
+                                    manager_endpoint,
                                     dht_state);
       }
     }

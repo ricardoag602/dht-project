@@ -45,7 +45,12 @@ void test_ring_state() {
   assert(ring.right_neighbor()->name == "alpha");
   assert(ring.peer_by_id(1)->name == "beta");
   assert(ring.peer_by_id(3) == nullptr);
+  assert(ring.members().size() == 3);
   assert(!ring.configure(3, members));
+  ring.clear();
+  assert(!ring.configured());
+  assert(ring.size() == 0);
+  assert(ring.right_neighbor() == nullptr);
 }
 
 void test_collision_safe_storage() {

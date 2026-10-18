@@ -15,7 +15,7 @@ namespace dht::manager {
 
 namespace {
 
-constexpr std::size_t kManagerBufferSize = 1024;
+constexpr std::size_t kManagerBufferSize = 65536;
 
 bool is_valid_peer_name(const std::string &name) {
   return !name.empty() && name.size() <= 15 &&
@@ -78,9 +78,17 @@ std::string Manager::process_command(const std::string &message) {
 
   const std::string &command = fields[0];
 
-  if (dht_status_ == DhtStatus::Building && command != "dht-complete") {
-    std::cout << "Command rejected while DHT setup is in progress: " << command
-              << "\n";
+  const bool command_allowed_during_transition =
+      (dht_status_ == DhtStatus::Building && command == "dht-complete") ||
+      (dht_status_ == DhtStatus::Rebuilding && command == "dht-rebuilt") ||
+      (dht_status_ == DhtStatus::TearingDown &&
+       command == "teardown-complete");
+  if ((dht_status_ == DhtStatus::Building ||
+       dht_status_ == DhtStatus::Rebuilding ||
+       dht_status_ == DhtStatus::TearingDown) &&
+      !command_allowed_during_transition) {
+    std::cout << "Command rejected while a DHT transition is in progress: "
+              << command << "\n";
     return "FAILURE";
   }
 
@@ -90,6 +98,20 @@ std::string Manager::process_command(const std::string &message) {
     return handle_setup_dht(fields);
   if (command == "dht-complete")
     return handle_dht_complete(fields);
+  if (command == "query-dht")
+    return handle_query_dht(fields);
+  if (command == "leave-dht")
+    return handle_leave_dht(fields);
+  if (command == "join-dht")
+    return handle_join_dht(fields);
+  if (command == "dht-rebuilt")
+    return handle_dht_rebuilt(fields);
+  if (command == "deregister")
+    return handle_deregister(fields);
+  if (command == "teardown-dht")
+    return handle_teardown_dht(fields);
+  if (command == "teardown-complete")
+    return handle_teardown_complete(fields);
 
   return "FAILURE";
 }
@@ -166,6 +188,10 @@ Manager::handle_setup_dht(const std::vector<std::string> &fields) {
 
   leader->second.state = PeerState::Leader;
   dht_status_ = DhtStatus::Building;
+  leader_name_ = leader_name;
+  dataset_year_ = fields[3];
+  dht_members_.clear();
+  dht_members_.push_back(leader_name);
 
   std::vector<std::string> response_fields{
       "SUCCESS", leader_name, leader->second.ip_address,
@@ -175,12 +201,13 @@ Manager::handle_setup_dht(const std::vector<std::string> &fields) {
     const std::string &selected_name = free_peer_names[index];
     PeerInfo &selected_peer = registered_peers_.at(selected_name);
     selected_peer.state = PeerState::InDHT;
+    dht_members_.push_back(selected_name);
     response_fields.push_back(selected_name);
     response_fields.push_back(selected_peer.ip_address);
     response_fields.push_back(std::to_string(selected_peer.peer_port));
   }
 
-  std::cout << "DHT Setup complete. Leader: " << leader_name << "\n";
+  std::cout << "DHT construction started. Leader: " << leader_name << "\n";
   return protocol::join_message(response_fields);
 }
 
@@ -203,6 +230,189 @@ Manager::handle_dht_complete(const std::vector<std::string> &fields) {
   std::cout << "DHT Complete failed: " << peer_name
             << " is not the leader.\n";
   return "FAILURE";
+}
+
+std::string
+Manager::handle_query_dht(const std::vector<std::string> &fields) {
+  if (fields.size() != 2 || dht_status_ != DhtStatus::Ready ||
+      dht_members_.empty()) {
+    return "FAILURE";
+  }
+
+  auto requester = registered_peers_.find(fields[1]);
+  if (requester == registered_peers_.end() ||
+      requester->second.state != PeerState::Free) {
+    return "FAILURE";
+  }
+
+  std::uniform_int_distribution<std::size_t> distribution(
+      0, dht_members_.size() - 1);
+  std::mt19937 generator(std::random_device{}());
+  const std::string &selected_name = dht_members_[distribution(generator)];
+  const PeerInfo &selected = registered_peers_.at(selected_name);
+  return protocol::join_message({"SUCCESS", selected_name,
+                                 selected.ip_address,
+                                 std::to_string(selected.peer_port)});
+}
+
+std::string
+Manager::handle_leave_dht(const std::vector<std::string> &fields) {
+  if (fields.size() != 2 || dht_status_ != DhtStatus::Ready ||
+      dht_members_.size() <= 1) {
+    return "FAILURE";
+  }
+
+  auto peer = registered_peers_.find(fields[1]);
+  if (peer == registered_peers_.end() ||
+      (peer->second.state != PeerState::Leader &&
+       peer->second.state != PeerState::InDHT)) {
+    return "FAILURE";
+  }
+
+  pending_peer_name_ = fields[1];
+  rebuild_kind_ = RebuildKind::Leave;
+  dht_status_ = DhtStatus::Rebuilding;
+  std::cout << "DHT leave started by " << pending_peer_name_ << ".\n";
+  return protocol::join_message({"SUCCESS", dataset_year_});
+}
+
+std::string Manager::handle_join_dht(const std::vector<std::string> &fields) {
+  if (fields.size() != 2 || dht_status_ != DhtStatus::Ready ||
+      dht_members_.empty()) {
+    return "FAILURE";
+  }
+
+  auto peer = registered_peers_.find(fields[1]);
+  if (peer == registered_peers_.end() ||
+      peer->second.state != PeerState::Free) {
+    return "FAILURE";
+  }
+
+  pending_peer_name_ = fields[1];
+  rebuild_kind_ = RebuildKind::Join;
+  dht_status_ = DhtStatus::Rebuilding;
+
+  std::vector<std::string> response{"SUCCESS", dataset_year_,
+                                    std::to_string(dht_members_.size())};
+  for (const std::string &member_name : dht_members_) {
+    const PeerInfo &member = registered_peers_.at(member_name);
+    response.push_back(member_name);
+    response.push_back(member.ip_address);
+    response.push_back(std::to_string(member.peer_port));
+  }
+
+  std::cout << "DHT join started by " << pending_peer_name_ << ".\n";
+  return protocol::join_message(response);
+}
+
+std::vector<std::string> Manager::prospective_members() const {
+  std::vector<std::string> members = dht_members_;
+  if (rebuild_kind_ == RebuildKind::Leave) {
+    members.erase(std::remove(members.begin(), members.end(),
+                              pending_peer_name_),
+                  members.end());
+  } else if (rebuild_kind_ == RebuildKind::Join) {
+    members.push_back(pending_peer_name_);
+  }
+  return members;
+}
+
+void Manager::assign_dht_states(const std::vector<std::string> &members,
+                                const std::string &leader_name) {
+  for (auto &[name, peer] : registered_peers_) {
+    if (std::find(members.begin(), members.end(), name) == members.end()) {
+      if (peer.state == PeerState::Leader || peer.state == PeerState::InDHT)
+        peer.state = PeerState::Free;
+      continue;
+    }
+    peer.state = name == leader_name ? PeerState::Leader : PeerState::InDHT;
+  }
+}
+
+std::string
+Manager::handle_dht_rebuilt(const std::vector<std::string> &fields) {
+  if (fields.size() != 3 || dht_status_ != DhtStatus::Rebuilding ||
+      rebuild_kind_ == RebuildKind::None || fields[1] != pending_peer_name_) {
+    return "FAILURE";
+  }
+
+  std::vector<std::string> members = prospective_members();
+  if (members.empty() ||
+      std::find(members.begin(), members.end(), fields[2]) == members.end()) {
+    return "FAILURE";
+  }
+
+  if (rebuild_kind_ == RebuildKind::Leave) {
+    auto leaving =
+        std::find(dht_members_.begin(), dht_members_.end(), pending_peer_name_);
+    if (leaving == dht_members_.end())
+      return "FAILURE";
+    std::size_t leaving_index =
+        static_cast<std::size_t>(leaving - dht_members_.begin());
+    const std::string &expected_leader =
+        dht_members_[(leaving_index + 1) % dht_members_.size()];
+    if (fields[2] != expected_leader)
+      return "FAILURE";
+  } else if (fields[2] != leader_name_) {
+    return "FAILURE";
+  }
+
+  auto leader_position = std::find(members.begin(), members.end(), fields[2]);
+  std::rotate(members.begin(), leader_position, members.end());
+  assign_dht_states(members, fields[2]);
+  dht_members_ = std::move(members);
+  leader_name_ = fields[2];
+  pending_peer_name_.clear();
+  rebuild_kind_ = RebuildKind::None;
+  dht_status_ = DhtStatus::Ready;
+  std::cout << "DHT rebuild completed. Leader: " << leader_name_ << ".\n";
+  return "SUCCESS";
+}
+
+std::string
+Manager::handle_deregister(const std::vector<std::string> &fields) {
+  if (fields.size() != 2)
+    return "FAILURE";
+
+  auto peer = registered_peers_.find(fields[1]);
+  if (peer == registered_peers_.end() ||
+      peer->second.state != PeerState::Free) {
+    return "FAILURE";
+  }
+
+  registered_peers_.erase(peer);
+  std::cout << "Deregistered peer " << fields[1] << ".\n";
+  return "SUCCESS";
+}
+
+std::string
+Manager::handle_teardown_dht(const std::vector<std::string> &fields) {
+  if (fields.size() != 2 || dht_status_ != DhtStatus::Ready ||
+      fields[1] != leader_name_) {
+    return "FAILURE";
+  }
+
+  dht_status_ = DhtStatus::TearingDown;
+  std::cout << "DHT teardown started by " << leader_name_ << ".\n";
+  return "SUCCESS";
+}
+
+std::string
+Manager::handle_teardown_complete(const std::vector<std::string> &fields) {
+  if (fields.size() != 2 || dht_status_ != DhtStatus::TearingDown ||
+      fields[1] != leader_name_) {
+    return "FAILURE";
+  }
+
+  assign_dht_states({}, "");
+  dht_members_.clear();
+  leader_name_.clear();
+  dataset_year_.clear();
+  pending_peer_name_.clear();
+  rebuild_kind_ = RebuildKind::None;
+  dht_status_ = DhtStatus::Absent;
+  std::cout << "DHT teardown completed.\n";
+  return "SUCCESS";
 }
 
 } // namespace dht::manager

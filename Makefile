@@ -22,7 +22,7 @@ TEST_SOURCES := tests/peer_components_test.cpp $(PEER_COMPONENT_SOURCES)
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean test
+.PHONY: all clean test manager-test integration-test
 
 all: $(MANAGER_BIN) $(PEER_BIN)
 
@@ -40,6 +40,12 @@ $(TEST_BIN): $(TEST_SOURCES) $(PEER_COMPONENT_HEADERS) $(COMMON_SOURCES) $(COMMO
 
 test: $(TEST_BIN)
 	$(TEST_BIN)
+
+manager-test: $(MANAGER_BIN)
+	python3 tests/manager_protocol_test.py
+
+integration-test: all
+	python3 tests/dht_integration_test.py
 
 clean:
 	$(RM) $(MANAGER_BIN) $(PEER_BIN) $(TEST_BIN)
