@@ -1,29 +1,16 @@
-#include <arpa/inet.h>
+#include "common/network.hpp"
+#include "common/protocol.hpp"
+
 #include <cstdlib>
-#include <cstring>
 #include <fstream>
 #include <iostream>
-#include <netinet/in.h>
 #include <sstream>
 #include <string>
 #include <sys/select.h>
 #include <sys/socket.h>
-#include <unordered_map>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
-
-// Decode a pipe-delimited network message while preserving empty fields.
-std::vector<std::string> split_message(const std::string &msg, char delimiter) {
-  std::vector<std::string> tokens;
-  std::string token;
-  std::istringstream tokenStream(msg);
-  while (std::getline(tokenStream, token, delimiter)) {
-    tokens.push_back(token);
-  }
-  if (!msg.empty() && msg.back() == delimiter)
-    tokens.push_back("");
-  return tokens;
-}
 
 struct PeerAddress {
   std::string name;
@@ -126,35 +113,26 @@ bool load_storm_records(const std::string &path,
 
 // Build the wire format used to move one record around the logical ring.
 std::string build_store_message(int destination_id, int position,
-           int hash_table_size,
-                               const StormRecord &record) {
+                                int hash_table_size,
+                                const StormRecord &record) {
   std::string message = "store|" + std::to_string(destination_id) + "|" +
-         std::to_string(position) + "|" +
-         std::to_string(hash_table_size);
+                        std::to_string(position) + "|" +
+                        std::to_string(hash_table_size);
   for (const std::string &field : record.fields)
     message += "|" + field;
   return message;
 }
 
 bool send_peer_message(int socket, const PeerAddress &peer,
-                  const std::string &message) {
-  struct sockaddr_in destination;
-  std::memset(&destination, 0, sizeof(destination));
-  destination.sin_family = AF_INET;
-  destination.sin_port = htons(peer.peer_port);
-  if (inet_pton(AF_INET, peer.ip_address.c_str(), &destination.sin_addr) != 1)
-    return false;
-
-  ssize_t sent = sendto(socket, message.c_str(), message.length(), 0,
-                        (const struct sockaddr *)&destination,
-                        sizeof(destination));
-  return sent == static_cast<ssize_t>(message.length());
+                       const std::string &message) {
+  return dht::network::send_udp_message(
+      socket, {peer.ip_address, peer.peer_port}, message);
 }
 
 // Store a record locally when this peer owns it, or forward it to the right.
 bool handle_store_message(const std::string &message, DhtContext &dht_state,
-                  int p_port_socket) {
-  std::vector<std::string> tokens = split_message(message, '|');
+                          int p_port_socket) {
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
   const size_t record_start = 4;
   if (tokens.size() != record_start + 14 || tokens[0] != "store")
     return false;
@@ -197,7 +175,7 @@ bool handle_store_message(const std::string &message, DhtContext &dht_state,
           "store-ack|" + std::to_string(destination_id) + "|" +
           std::to_string(record.event_id) + "|" + std::to_string(position);
       if (!send_peer_message(p_port_socket, dht_state.right_peer,
-                        acknowledgement)) {
+                             acknowledgement)) {
         return false;
       }
     }
@@ -220,7 +198,7 @@ bool handle_store_message(const std::string &message, DhtContext &dht_state,
 // Return store acknowledgements to the leader through the same ring direction.
 bool handle_store_ack(const std::string &message, DhtContext &dht_state,
                       int p_port_socket) {
-  std::vector<std::string> tokens = split_message(message, '|');
+  std::vector<std::string> tokens = dht::protocol::split_message(message);
   if (tokens.size() != 4 || tokens[0] != "store-ack")
     return false;
 
@@ -244,7 +222,7 @@ bool handle_store_ack(const std::string &message, DhtContext &dht_state,
 
 // Load the selected year, hash each record, and start ring-based distribution.
 bool distribute_records(const std::string &year, DhtContext &dht_state,
-                              int p_port_socket) {
+                        int p_port_socket) {
   std::vector<StormRecord> records;
   std::string path = "details-" + year + ".csv";
   if (!load_storm_records(path, records)) {
@@ -269,14 +247,14 @@ bool distribute_records(const std::string &year, DhtContext &dht_state,
   for (const StormRecord &record : records) {
     int position = record.event_id % dht_state.hash_table_size;
     int destination_id = position % dht_state.ring_size;
-    std::string message =
-        build_store_message(destination_id, position, dht_state.hash_table_size,
-               record);
+    std::string message = build_store_message(
+        destination_id, position, dht_state.hash_table_size, record);
 
     if (destination_id == dht_state.peer_id) {
       if (!handle_store_message(message, dht_state, p_port_socket))
         return false;
-    } else if (!send_peer_message(p_port_socket, dht_state.right_peer, message)) {
+    } else if (!send_peer_message(p_port_socket, dht_state.right_peer,
+                                  message)) {
       std::cerr << "Failed to send store for event " << record.event_id
                 << " to the right neighbor.\n";
       return false;
@@ -285,42 +263,14 @@ bool distribute_records(const std::string &year, DhtContext &dht_state,
   return true;
 }
 
-// Create the UDP socket used for peer-to-peer ring traffic.
-int create_peer_socket(int port) {
-  int sock = socket(AF_INET, SOCK_DGRAM, 0);
-  if (sock < 0)
-    return -1;
-
-  struct sockaddr_in p_addr;
-  std::memset(&p_addr, 0, sizeof(p_addr));
-  p_addr.sin_family = AF_INET;
-  p_addr.sin_addr.s_addr = INADDR_ANY;
-  p_addr.sin_port = htons(port);
-
-  if (bind(sock, (const struct sockaddr *)&p_addr, sizeof(p_addr)) < 0) {
-    std::cerr << "Error: Bind failed on P2P port " << port
-              << ". Port may be in use.\n";
-    close(sock);
-    return -1;
-  }
-  return sock;
-}
-
-bool bind_manager_socket(int socket, int port) {
-  struct sockaddr_in address;
-  std::memset(&address, 0, sizeof(address));
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = INADDR_ANY;
-  address.sin_port = htons(port);
-  return bind(socket, (const struct sockaddr *)&address, sizeof(address)) == 0;
-}
-
 // Apply a manager response and trigger the peer-side work it starts.
 void handle_manager_response(const std::string &req_msg,
                              const std::string &resp_msg, int &p_port_socket,
                              DhtContext &dht_state) {
-  std::vector<std::string> req_tokens = split_message(req_msg, '|');
-  std::vector<std::string> resp_tokens = split_message(resp_msg, '|');
+  std::vector<std::string> req_tokens =
+      dht::protocol::split_message(req_msg);
+  std::vector<std::string> resp_tokens =
+      dht::protocol::split_message(resp_msg);
 
   if (req_tokens.empty() || resp_tokens.empty())
     return;
@@ -328,11 +278,14 @@ void handle_manager_response(const std::string &req_msg,
   // Handle successful registration: Bind the local P2P socket
   if (req_tokens[0] == "register" && resp_tokens[0] == "SUCCESS") {
     int peer_port = std::stoi(req_tokens[4]);
-    p_port_socket = create_peer_socket(peer_port);
+    p_port_socket = dht::network::create_bound_udp_socket(peer_port);
 
     if (p_port_socket != -1) {
       std::cout << "Local P2P socket successfully bound to port " << peer_port
                 << ".\n";
+    } else {
+      std::cerr << "Error: Bind failed on P2P port " << peer_port
+                << ". Port may be in use.\n";
     }
   }
 
@@ -354,9 +307,9 @@ void handle_manager_response(const std::string &req_msg,
 
     for (int i = 0; i < n; ++i) {
       int base_idx = 1 + (i * 3);
-      dht_state.ring_peers.push_back(
-          {resp_tokens[base_idx], resp_tokens[base_idx + 1],
-           std::stoi(resp_tokens[base_idx + 2])});
+      dht_state.ring_peers.push_back({resp_tokens[base_idx],
+                                      resp_tokens[base_idx + 1],
+                                      std::stoi(resp_tokens[base_idx + 2])});
     }
     dht_state.right_peer = dht_state.ring_peers[1 % n];
 
@@ -377,14 +330,8 @@ void handle_manager_response(const std::string &req_msg,
       std::string set_id_msg =
           "set-id|" + std::to_string(i) + "|" + std::to_string(n) + all_tuples;
 
-      struct sockaddr_in peer_dest;
-      std::memset(&peer_dest, 0, sizeof(peer_dest));
-      peer_dest.sin_family = AF_INET;
-      peer_dest.sin_port = htons(target_port);
-      inet_pton(AF_INET, target_ip.c_str(), &peer_dest.sin_addr);
-
-      sendto(p_port_socket, set_id_msg.c_str(), set_id_msg.length(), 0,
-             (const struct sockaddr *)&peer_dest, sizeof(peer_dest));
+      dht::network::send_udp_message(p_port_socket, {target_ip, target_port},
+                                     set_id_msg);
 
       std::cout << "Sent set-id data to " << target_name << " at " << target_ip
                 << ":" << target_port << "\n";
@@ -400,7 +347,7 @@ void handle_manager_response(const std::string &req_msg,
 }
 
 bool handle_set_id(const std::string &msg, DhtContext &dht_state) {
-  std::vector<std::string> tokens = split_message(msg, '|');
+  std::vector<std::string> tokens = dht::protocol::split_message(msg);
   if (tokens.size() < 3 || tokens[0] != "set-id")
     return false;
 
@@ -418,15 +365,14 @@ bool handle_set_id(const std::string &msg, DhtContext &dht_state) {
 
   for (int i = 0; i < ring_size; ++i) {
     int base_idx = 3 + (i * 3);
-    dht_state.ring_peers.push_back(
-        {tokens[base_idx], tokens[base_idx + 1],
-         std::stoi(tokens[base_idx + 2])});
+    dht_state.ring_peers.push_back({tokens[base_idx], tokens[base_idx + 1],
+                                    std::stoi(tokens[base_idx + 2])});
   }
   dht_state.right_peer = dht_state.ring_peers[(peer_id + 1) % ring_size];
 
   std::cout << "Configured DHT id=" << dht_state.peer_id
-            << ", ring size=" << dht_state.ring_size << ", right neighbor="
-            << dht_state.right_peer.name << " at "
+            << ", ring size=" << dht_state.ring_size
+            << ", right neighbor=" << dht_state.right_peer.name << " at "
             << dht_state.right_peer.ip_address << ":"
             << dht_state.right_peer.peer_port << "\n";
   return true;
@@ -448,12 +394,12 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
 
-  int manager_socket = socket(AF_INET, SOCK_DGRAM, 0);
-  struct sockaddr_in dest_addr;
-  std::memset(&dest_addr, 0, sizeof(dest_addr));
-  dest_addr.sin_family = AF_INET;
-  dest_addr.sin_port = htons(manager_port);
-  inet_pton(AF_INET, manager_ip.c_str(), &dest_addr.sin_addr);
+  int manager_socket = dht::network::create_udp_socket();
+  if (manager_socket < 0) {
+    std::cerr << "Error: Unable to create manager socket.\n";
+    return EXIT_FAILURE;
+  }
+  dht::network::UdpEndpoint manager_endpoint{manager_ip, manager_port};
 
   int peer_socket = -1;
   bool manager_socket_bound = false;
@@ -495,17 +441,14 @@ int main(int argc, char *argv[]) {
 
       std::istringstream iss(input_line);
       std::string token;
-      wire_msg = "";
-      bool first = true;
-      while (iss >> token) {
-        if (!first)
-          wire_msg += "|";
-        wire_msg += token;
-        first = false;
-      }
+      std::vector<std::string> command_fields;
+      while (iss >> token)
+        command_fields.push_back(token);
+      wire_msg = dht::protocol::join_message(command_fields);
 
       // Send the command to the manager and wait for a response.
-      std::vector<std::string> request_tokens = split_message(wire_msg, '|');
+      std::vector<std::string> request_tokens =
+          dht::protocol::split_message(wire_msg);
       if (request_tokens.size() == 5 && request_tokens[0] == "register" &&
           !manager_socket_bound) {
         int manager_peer_port;
@@ -517,7 +460,8 @@ int main(int argc, char *argv[]) {
           continue;
         }
 
-        if (!bind_manager_socket(manager_socket, manager_peer_port)) {
+        if (!dht::network::bind_udp_socket(manager_socket,
+                                           manager_peer_port)) {
           std::cerr << "Unable to bind manager socket to port "
                     << manager_peer_port << ".\n";
           std::cout << "> ";
@@ -528,8 +472,12 @@ int main(int argc, char *argv[]) {
                   << ".\n";
       }
 
-      sendto(manager_socket, wire_msg.c_str(), wire_msg.length(), 0,
-             (const struct sockaddr *)&dest_addr, sizeof(dest_addr));
+      if (!dht::network::send_udp_message(manager_socket, manager_endpoint,
+                                          wire_msg)) {
+        std::cerr << "Unable to send command to the manager.\n";
+        std::cout << "> ";
+        continue;
+      }
 
       char recv_buffer[1024];
       struct sockaddr_in from_addr;
@@ -544,7 +492,7 @@ int main(int argc, char *argv[]) {
         std::cout << "Manager replied: " << manager_response << "\n";
 
         handle_manager_response(wire_msg, manager_response, peer_socket,
-               dht_state);
+                                dht_state);
       }
       std::cout << "> ";
     }
@@ -555,9 +503,9 @@ int main(int argc, char *argv[]) {
       struct sockaddr_in from_peer_addr;
       socklen_t from_peer_len = sizeof(from_peer_addr);
 
-      ssize_t p2p_bytes = recvfrom(
-          peer_socket, p2p_buffer, sizeof(p2p_buffer) - 1, MSG_WAITALL,
-          (struct sockaddr *)&from_peer_addr, &from_peer_len);
+      ssize_t p2p_bytes =
+          recvfrom(peer_socket, p2p_buffer, sizeof(p2p_buffer) - 1, MSG_WAITALL,
+                   (struct sockaddr *)&from_peer_addr, &from_peer_len);
       if (p2p_bytes > 0) {
         p2p_buffer[p2p_bytes] = '\0';
         std::cout << "\n[P2P Message Received]: " << p2p_buffer << "\n> ";
@@ -578,28 +526,30 @@ int main(int argc, char *argv[]) {
             !dht_state.completion_reported &&
             dht_state.acknowledged_records == dht_state.total_records) {
           wire_msg = "dht-complete|" + dht_state.local_peer_name;
-          sendto(manager_socket, wire_msg.c_str(), wire_msg.length(), 0,
-                 (const struct sockaddr *)&dest_addr, sizeof(dest_addr));
+          if (!dht::network::send_udp_message(manager_socket, manager_endpoint,
+                                              wire_msg)) {
+            std::cerr << "Unable to send dht-complete to the manager.\n";
+            continue;
+          }
 
           char completion_buffer[1024];
           struct sockaddr_in completion_addr;
           socklen_t completion_len = sizeof(completion_addr);
-          ssize_t completion_bytes = recvfrom(
-              manager_socket, completion_buffer, sizeof(completion_buffer) - 1,
-              MSG_WAITALL, (struct sockaddr *)&completion_addr,
-              &completion_len);
+          ssize_t completion_bytes =
+              recvfrom(manager_socket, completion_buffer,
+                       sizeof(completion_buffer) - 1, MSG_WAITALL,
+                       (struct sockaddr *)&completion_addr, &completion_len);
           if (completion_bytes > 0) {
             completion_buffer[completion_bytes] = '\0';
             std::string completion_response(completion_buffer);
             std::cout << "Manager replied: " << completion_response << "\n";
             if (completion_response == "SUCCESS") {
-                  dht_state.completion_reported = true;
-                  dht_state.setup_in_progress = false;
-              for (size_t peer_id = 0;
-                    peer_id < dht_state.record_counts.size(); ++peer_id) {
+              dht_state.completion_reported = true;
+              dht_state.setup_in_progress = false;
+              for (size_t peer_id = 0; peer_id < dht_state.record_counts.size();
+                   ++peer_id) {
                 std::cout << "Peer id " << peer_id << " stored "
-                     << dht_state.record_counts[peer_id]
-                          << " records.\n";
+                          << dht_state.record_counts[peer_id] << " records.\n";
               }
             }
           }
